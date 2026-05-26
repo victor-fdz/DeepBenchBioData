@@ -1,0 +1,8 @@
+README.md
+setup.py
+normalization_pipeline.egg-info/PKG-INFO
+normalization_pipeline.egg-info/SOURCES.txt
+normalization_pipeline.egg-info/dependency_links.txt
+normalization_pipeline.egg-info/entry_points.txt
+normalization_pipeline.egg-info/requires.txt
+normalization_pipeline.egg-info/top_level.txt

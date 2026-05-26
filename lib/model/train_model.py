@@ -1,0 +1,974 @@
+#!/usr/bin/env python3
+"""Training utilities for Siamese promoter models."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import matplotlib.pyplot as plt
+import numpy as np
+import optuna
+import pandas as pd
+import torch
+import torch.nn.functional as F
+from scipy.stats import kendalltau
+from scipy.stats import pearsonr
+from scipy.stats import spearmanr
+from sklearn.model_selection import StratifiedKFold
+from torch.utils.data import DataLoader
+
+from lib.model.datasets import DNAPairDatasetWithMeta
+from lib.model.loss_function import ContrastiveLossCosine
+from lib.model.model import SiameseCNN
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="\033[1;32m%(levelname)s\033[0m | "
+           "\033[1;36m%(name)s\033[0m | %(message)s",
+)
+
+logger = logging.getLogger(__name__)
+
+OUTPUT_DIR = Path("results")
+
+DEFAULT_BATCH_SIZE = 32
+DEFAULT_NUM_EPOCHS = 6
+DEFAULT_LEARNING_RATE = 0.032
+DEFAULT_MARGIN = 1.41
+DEFAULT_DROPOUT = 0.26
+DEFAULT_WEIGHT_DECAY = 7.66e-5
+DEFAULT_KERNEL_SIZE_SMALL = 6
+DEFAULT_KERNEL_SIZE_MEDIUM = 12
+DEFAULT_KERNEL_SIZE_LARGE = 20
+DEFAULT_ATTENTION_HEADS = 4
+DEFAULT_EMBEDDING_DIM = 16
+
+DEFAULT_OPTUNA_TRIALS = 20
+DEFAULT_OPTUNA_JOBS = 1
+DEFAULT_OPTUNA_FOLDS = 5
+DEFAULT_OPTUNA_EPOCHS = 8
+DEFAULT_RANDOM_STATE = 42
+
+
+# -----------------------------
+# CLI
+# -----------------------------
+def parse_args(cli_args: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments."""
+
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    parser.add_argument("--train", required=True, type=Path)
+    parser.add_argument("--validation", required=True, type=Path)
+    parser.add_argument("--name", required=True)
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--metric", default=None)
+
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--epochs", type=int, default=DEFAULT_NUM_EPOCHS)
+    parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
+    parser.add_argument("--margin", type=float, default=DEFAULT_MARGIN)
+    parser.add_argument("--dropout", type=float, default=DEFAULT_DROPOUT)
+    parser.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
+
+    parser.add_argument("--small-kernel-size", type=int, default=DEFAULT_KERNEL_SIZE_SMALL)
+    parser.add_argument("--medium-kernel-size", type=int, default=DEFAULT_KERNEL_SIZE_MEDIUM)
+    parser.add_argument("--large-kernel-size", type=int, default=DEFAULT_KERNEL_SIZE_LARGE)
+    parser.add_argument("--attention-heads", type=int, default=DEFAULT_ATTENTION_HEADS)
+    parser.add_argument("--embedding-dim", type=int, default=DEFAULT_EMBEDDING_DIM)
+
+    parser.add_argument("--optimize", action="store_true")
+    parser.add_argument("--optuna-trials", type=int, default=DEFAULT_OPTUNA_TRIALS)
+    parser.add_argument("--optuna-jobs", type=int, default=DEFAULT_OPTUNA_JOBS)
+    parser.add_argument("--optuna-folds", type=int, default=DEFAULT_OPTUNA_FOLDS)
+    parser.add_argument("--optuna-epochs", type=int, default=DEFAULT_OPTUNA_EPOCHS)
+
+    return parser.parse_args(cli_args)
+
+
+# -----------------------------
+# Validation helpers
+# -----------------------------
+def _validate_loader_not_empty(loader: DataLoader, name: str) -> None:
+    if len(loader) == 0:
+        raise ValueError(f"{name} dataloader is empty.")
+
+
+def _prepare_binary_labels_for_stratification(df_train: pd.DataFrame) -> pd.Series:
+    label_map = {
+        "P": 1,
+        "N": 0,
+        "1": 1,
+        "0": 0,
+        1: 1,
+        0: 0,
+        1.0: 1,
+        0.0: 0,
+    }
+
+    if "label" not in df_train.columns:
+        raise ValueError("df_train is missing required column 'label'.")
+
+    labels_for_stratification = df_train["label"].map(label_map)
+
+    if labels_for_stratification.isna().any():
+        bad_labels = df_train.loc[
+            labels_for_stratification.isna(),
+            "label",
+        ].drop_duplicates().tolist()
+
+        raise ValueError(
+            f"Invalid labels found before Optuna stratification: {bad_labels}"
+        )
+
+    labels_for_stratification = labels_for_stratification.astype(int)
+    label_counts = labels_for_stratification.value_counts()
+
+    if len(label_counts) != 2:
+        raise ValueError(
+            f"Optuna requires both labels 0 and 1. Observed labels: {dict(label_counts)}"
+        )
+
+    return labels_for_stratification
+
+
+# -----------------------------
+# Diagnostics
+# -----------------------------
+def collect_epoch_embedding_distances(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    split_name: str,
+    epoch: int,
+) -> list[dict[str, Any]]:
+    """Compute mean cosine distance between pair embeddings by label."""
+
+    model.eval()
+
+    distance_sum = {1: 0.0, 0: 0.0}
+    distance_count = {1: 0, 0: 0}
+
+    with torch.no_grad():
+        for seq1, seq2, labels, *_ in loader:
+            output1, output2 = model(seq1, seq2)
+            distances = 1 - F.cosine_similarity(output1, output2)
+            labels_int = labels.to(torch.int64)
+
+            for label_value in (1, 0):
+                mask = labels_int == label_value
+
+                if mask.any():
+                    distance_sum[label_value] += float(distances[mask].sum().item())
+                    distance_count[label_value] += int(mask.sum().item())
+
+    rows = []
+
+    for label_value in (1, 0):
+        rows.append(
+            {
+                "epoch": epoch,
+                "split": split_name,
+                "label": "P" if label_value == 1 else "N",
+                "label_value": label_value,
+                "mean_cosine_distance": (
+                    distance_sum[label_value] / distance_count[label_value]
+                    if distance_count[label_value] > 0
+                    else np.nan
+                ),
+                "n_pairs": distance_count[label_value],
+            }
+        )
+
+    return rows
+
+
+# -----------------------------
+# Core training
+# -----------------------------
+def train_model(
+    model: torch.nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    criterion: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    num_epochs: int,
+    model_path: Path,
+    summary_path: Path,
+    training_summary: str,
+    diagnostics_path: Path | None = None,
+) -> torch.nn.Module:
+    """Train Siamese model."""
+
+    if num_epochs <= 0:
+        raise ValueError("num_epochs must be a positive integer.")
+
+    _validate_loader_not_empty(train_loader, "Training")
+    _validate_loader_not_empty(val_loader, "Validation")
+
+    logger.info("Starting model training (%d epochs).", num_epochs)
+
+    diagnostic_rows = []
+
+    for epoch in range(1, num_epochs + 1):
+        model.train()
+        train_loss = 0.0
+
+        for seq1, seq2, labels, *_ in train_loader:
+            optimizer.zero_grad()
+            output1, output2 = model(seq1, seq2)
+
+            loss = criterion(
+                output1,
+                output2,
+                labels,
+            )
+
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        model.eval()
+        val_loss = 0.0
+
+        with torch.no_grad():
+            for seq1, seq2, labels, *_ in val_loader:
+                output1, output2 = model(seq1, seq2)
+
+                val_loss += criterion(
+                    output1,
+                    output2,
+                    labels,
+                ).item()
+
+        avg_train_loss = train_loss / len(train_loader)
+        avg_val_loss = val_loss / len(val_loader)
+
+        logger.info(
+            "Epoch %d | train=%.4f | val=%.4f",
+            epoch,
+            avg_train_loss,
+            avg_val_loss,
+        )
+
+        if diagnostics_path is not None:
+            diagnostic_rows.extend(
+                collect_epoch_embedding_distances(
+                    model=model,
+                    loader=train_loader,
+                    split_name="train",
+                    epoch=epoch,
+                )
+            )
+
+            diagnostic_rows.extend(
+                collect_epoch_embedding_distances(
+                    model=model,
+                    loader=val_loader,
+                    split_name="validation",
+                    epoch=epoch,
+                )
+            )
+
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), model_path)
+
+    with summary_path.open("w", encoding="utf-8") as handle:
+        handle.write(training_summary)
+
+    if diagnostics_path is not None:
+        pd.DataFrame(diagnostic_rows).to_csv(
+            diagnostics_path,
+            sep="\t",
+            index=False,
+        )
+
+        logger.info("Epoch embedding distances saved to %s", diagnostics_path)
+
+    logger.info("Model weights saved to %s", model_path)
+
+    return model
+
+
+# -----------------------------
+# Hyperparameter optimization
+# -----------------------------
+def optimize_hyperparameters(
+    df_train: pd.DataFrame,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    n_trials: int = DEFAULT_OPTUNA_TRIALS,
+    n_jobs: int = DEFAULT_OPTUNA_JOBS,
+    n_folds: int = DEFAULT_OPTUNA_FOLDS,
+    trial_epochs: int = DEFAULT_OPTUNA_EPOCHS,
+    fixed_margin: float = DEFAULT_MARGIN,
+    attention_heads: int = DEFAULT_ATTENTION_HEADS,
+    embedding_dim: int = DEFAULT_EMBEDDING_DIM,
+    optuna_output_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Run Optuna hyperparameter search using stratified cross-validation."""
+
+    if n_trials <= 0:
+        raise ValueError("n_trials must be a positive integer.")
+
+    if n_jobs <= 0:
+        raise ValueError("n_jobs must be a positive integer.")
+
+    if n_folds < 2:
+        raise ValueError("n_folds must be at least 2.")
+
+    if trial_epochs <= 0:
+        raise ValueError("trial_epochs must be a positive integer.")
+
+    labels_for_stratification = _prepare_binary_labels_for_stratification(df_train)
+    label_counts = labels_for_stratification.value_counts()
+
+    if label_counts.min() < n_folds:
+        raise ValueError(
+            "n_folds cannot be larger than the smallest label class. "
+            f"Label counts: {dict(label_counts)} | n_folds={n_folds}"
+        )
+
+    logger.info(
+        "Running Optuna optimization: trials=%d | jobs=%d | folds=%d | trial_epochs=%d.",
+        n_trials,
+        n_jobs,
+        n_folds,
+        trial_epochs,
+    )
+
+    if n_jobs > 1:
+        torch.set_num_threads(1)
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            logger.warning("Could not reset PyTorch interop threads. Continuing.")
+        logger.info("Parallel Optuna enabled. Forced PyTorch threads per trial to 1.")
+
+    stratified_splitter = StratifiedKFold(
+        n_splits=n_folds,
+        shuffle=True,
+        random_state=DEFAULT_RANDOM_STATE,
+    )
+
+    def objective(trial: optuna.trial.Trial) -> float:
+        learning_rate = trial.suggest_float(
+            "learning_rate",
+            1e-5,
+            5e-2,
+            log=True,
+        )
+
+        weight_decay = trial.suggest_categorical(
+            "weight_decay",
+            [0.0, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2],
+        )
+
+        dropout_rate = trial.suggest_float(
+            "dropout_rate",
+            0.0,
+            0.8,
+        )
+
+        small_kernel_size = trial.suggest_categorical(
+            "small_kernel_size",
+            [4, 6, 8],
+        )
+
+        medium_kernel_size = trial.suggest_categorical(
+            "medium_kernel_size",
+            [10, 12, 16],
+        )
+
+        large_kernel_size = trial.suggest_categorical(
+            "large_kernel_size",
+            [18, 20, 24, 30],
+        )
+
+        fold_losses = []
+
+        for fold_index, (train_idx, val_idx) in enumerate(
+            stratified_splitter.split(df_train, labels_for_stratification)
+        ):
+            trial_seed = DEFAULT_RANDOM_STATE + trial.number * 1000 + fold_index
+
+            data_loader_generator = torch.Generator()
+            data_loader_generator.manual_seed(trial_seed)
+
+            fold_train = df_train.iloc[train_idx].copy()
+            fold_val = df_train.iloc[val_idx].copy()
+
+            train_loader = DataLoader(
+                DNAPairDatasetWithMeta(fold_train),
+                batch_size=batch_size,
+                shuffle=True,
+                generator=data_loader_generator,
+                num_workers=0,
+            )
+
+            val_loader = DataLoader(
+                DNAPairDatasetWithMeta(fold_val),
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=0,
+            )
+
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(trial_seed)
+                model = SiameseCNN(
+                    dropout_rate=dropout_rate,
+                    small_kernel_size=small_kernel_size,
+                    medium_kernel_size=medium_kernel_size,
+                    large_kernel_size=large_kernel_size,
+                    attention_heads=attention_heads,
+                    embedding_dim=embedding_dim,
+                )
+
+            criterion = ContrastiveLossCosine(margin=fixed_margin)
+
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=learning_rate,
+                weight_decay=weight_decay,
+            )
+
+            for _ in range(trial_epochs):
+                model.train()
+
+                for seq1, seq2, labels, *_ in train_loader:
+                    optimizer.zero_grad()
+                    out1, out2 = model(seq1, seq2)
+
+                    loss = criterion(
+                        out1,
+                        out2,
+                        labels,
+                    )
+
+                    loss.backward()
+                    optimizer.step()
+
+            model.eval()
+            val_loss = 0.0
+
+            with torch.no_grad():
+                for seq1, seq2, labels, *_ in val_loader:
+                    out1, out2 = model(seq1, seq2)
+
+                    val_loss += criterion(
+                        out1,
+                        out2,
+                        labels,
+                    ).item()
+
+            fold_losses.append(val_loss / len(val_loader))
+
+        return float(np.mean(fold_losses))
+
+    study = optuna.create_study(direction="minimize")
+    study.optimize(
+        objective,
+        n_trials=n_trials,
+        n_jobs=n_jobs,
+        show_progress_bar=(n_jobs == 1),
+    )
+
+    logger.info("Best hyperparameters: %s", study.best_params)
+
+    if optuna_output_dir is not None:
+        optuna_output_dir.mkdir(parents=True, exist_ok=True)
+
+        with (optuna_output_dir / "optuna_best_params.json").open("w", encoding="utf-8") as handle:
+            json.dump(study.best_params, handle, indent=2)
+
+        study.trials_dataframe().to_csv(
+            optuna_output_dir / "optuna_trials.tsv",
+            sep="\t",
+            index=False,
+        )
+
+    return study.best_params
+
+
+# -----------------------------
+# Plots
+# -----------------------------
+def plot_epoch_embedding_distances(
+    distances_path: Path,
+    output_path: Path | None = None,
+    split_name: str = "train",
+) -> Path:
+    """Plot mean embedding cosine distance across epochs for P/N pairs."""
+
+    df = pd.read_csv(distances_path, sep="\t")
+
+    required_cols = {
+        "epoch",
+        "split",
+        "label",
+        "mean_cosine_distance",
+    }
+
+    missing_cols = required_cols - set(df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"Missing required columns in {distances_path}: {sorted(missing_cols)}"
+        )
+
+    df = df[df["split"] == split_name].copy()
+
+    if df.empty:
+        raise ValueError(f"No rows found for split={split_name!r} in {distances_path}")
+
+    positive = df[df["label"].isin(["P", 1, "1"])].sort_values("epoch").copy()
+    negative = df[df["label"].isin(["N", 0, "0"])].sort_values("epoch").copy()
+
+    positive["plot_distance"] = positive["mean_cosine_distance"]
+    negative["plot_distance"] = 2 - negative["mean_cosine_distance"]
+
+    if positive.empty or negative.empty:
+        raise ValueError("Both positive and negative rows are required for plotting.")
+
+    if output_path is None:
+        output_path = distances_path.parent / f"{split_name}_embedding_distance_dynamics.png"
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    plt.rcParams.update(
+        {
+            "font.size": 8,
+            "axes.labelsize": 9,
+            "axes.titlesize": 10,
+            "xtick.labelsize": 8,
+            "ytick.labelsize": 8,
+            "legend.fontsize": 8,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        }
+    )
+
+    fig, ax = plt.subplots(figsize=(3.4, 2.4))
+
+    ax.plot(
+        positive["epoch"],
+        positive["plot_distance"],
+        color="green",
+        linewidth=2.2,
+        marker="o",
+        markersize=3.5,
+        label="Positive pairs",
+    )
+
+    ax.plot(
+        negative["epoch"],
+        negative["plot_distance"],
+        color="red",
+        linewidth=2.2,
+        marker="o",
+        markersize=3.5,
+        label="Negative pairs",
+    )
+
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Pulling / pushing score")
+    ax.set_title(f"Embedding distance dynamics ({split_name})")
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.35)
+    ax.legend(frameon=False, loc="best")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=600, bbox_inches="tight")
+    plt.close(fig)
+
+    logger.info("Embedding distance dynamics plot saved to %s", output_path)
+
+    return output_path
+
+
+def _guess_metric_column(dataframe: pd.DataFrame) -> str:
+    candidates = [
+        "cosine_sim",
+        "met",
+        "ssd",
+        "net_sim",
+        "shannon_sim",
+        "tau_sim",
+        "z_score_cosine_sim",
+        "gini_sim",
+    ]
+
+    for column in candidates:
+        if column in dataframe.columns:
+            return column
+
+    raise ValueError("Could not infer expression similarity metric column.")
+
+
+def save_embedding_similarity_dataframe(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    source_dataframe: pd.DataFrame,
+    output_path: Path,
+    metric_column: str,
+) -> pd.DataFrame:
+    """Save embedding similarities aligned to the source dataframe by pair_row_id."""
+
+    if metric_column not in source_dataframe.columns:
+        raise ValueError(f"Missing metric column in source dataframe: {metric_column}")
+
+    model.eval()
+    rows = []
+
+    with torch.no_grad():
+        for seq1, seq2, labels, pair_row_id, gene_id_1, gene_id_2 in loader:
+            output1, output2 = model(seq1, seq2)
+
+            embedding_similarity = F.cosine_similarity(
+                output1,
+                output2,
+            ).cpu().numpy()
+
+            for row_id, first_gene, second_gene, similarity in zip(
+                pair_row_id,
+                gene_id_1,
+                gene_id_2,
+                embedding_similarity,
+            ):
+                rows.append(
+                    {
+                        "pair_row_id": int(row_id),
+                        "gene_id_1": first_gene,
+                        "gene_id_2": second_gene,
+                        "embedding_cosine_sim": float(similarity),
+                    }
+                )
+
+    prediction_dataframe = pd.DataFrame(rows)
+
+    target_columns = ["pair_row_id", metric_column]
+    if "original_label" in source_dataframe.columns:
+        target_columns.append("original_label")
+    elif "label" in source_dataframe.columns:
+        target_columns.append("label")
+
+    target_dataframe = source_dataframe[target_columns].copy()
+
+    output_dataframe = prediction_dataframe.merge(
+        target_dataframe,
+        on="pair_row_id",
+        how="inner",
+    )
+
+    if len(output_dataframe) != len(prediction_dataframe):
+        raise ValueError("Embedding similarity merge changed the number of rows.")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_dataframe.to_csv(output_path, sep="\t", index=False)
+
+    return output_dataframe
+
+
+def plot_embedding_vs_expression_similarity(
+    dataframe: pd.DataFrame,
+    metric_column: str,
+    output_path: Path,
+    title: str,
+) -> None:
+    """Plot embedding similarity against expression similarity."""
+
+    x = dataframe["embedding_cosine_sim"].to_numpy(dtype=float)
+    y = dataframe[metric_column].to_numpy(dtype=float)
+
+    if len(dataframe) < 2:
+        raise ValueError(f"Need at least two rows to plot {title}.")
+
+    if np.unique(x).size < 2 or np.unique(y).size < 2:
+        raise ValueError(f"Cannot plot correlations for {title}: one axis is constant.")
+
+    pearson_value, _ = pearsonr(x, y)
+    spearman_value, _ = spearmanr(x, y)
+    kendall_value, _ = kendalltau(x, y)
+
+    plt.figure(figsize=(6, 5))
+    plt.scatter(x, y, alpha=0.2, s=6)
+    plt.xlabel("Embedding cosine similarity", fontsize=13)
+    plt.ylabel(f"Expression similarity ({metric_column})", fontsize=13)
+    plt.title(
+        (
+            f"{title}\n"
+            f"Pearson={pearson_value:.3f} | "
+            f"Spearman={spearman_value:.3f} | "
+            f"Kendall={kendall_value:.3f}"
+        ),
+        fontsize=14,
+    )
+    plt.xticks(fontsize=11)
+    plt.yticks(fontsize=11)
+    plt.tight_layout()
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_path, dpi=300)
+    plt.close()
+
+
+def save_model_config(
+    output_path: Path,
+    model_config: dict[str, Any],
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(model_config, handle, indent=2)
+
+
+# -----------------------------
+# Full training pipeline
+# -----------------------------
+def run_training(
+    df_train: pd.DataFrame,
+    df_val: pd.DataFrame,
+    model_output_dir: Path,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    margin: float = DEFAULT_MARGIN,
+    num_epochs: int = DEFAULT_NUM_EPOCHS,
+    learning_rate: float = DEFAULT_LEARNING_RATE,
+    dropout_rate: float = DEFAULT_DROPOUT,
+    weight_decay: float = DEFAULT_WEIGHT_DECAY,
+    small_kernel_size: int = DEFAULT_KERNEL_SIZE_SMALL,
+    medium_kernel_size: int = DEFAULT_KERNEL_SIZE_MEDIUM,
+    large_kernel_size: int = DEFAULT_KERNEL_SIZE_LARGE,
+    attention_heads: int = DEFAULT_ATTENTION_HEADS,
+    embedding_dim: int = DEFAULT_EMBEDDING_DIM,
+    optimize_hparams: bool = False,
+    optuna_trials: int = DEFAULT_OPTUNA_TRIALS,
+    optuna_jobs: int = DEFAULT_OPTUNA_JOBS,
+    optuna_folds: int = DEFAULT_OPTUNA_FOLDS,
+    optuna_epochs: int = DEFAULT_OPTUNA_EPOCHS,
+    metric_column: str | None = None,
+) -> torch.nn.Module:
+    """Full Siamese training workflow."""
+
+    model_output_dir.mkdir(parents=True, exist_ok=True)
+
+    if optimize_hparams:
+        best = optimize_hyperparameters(
+            df_train=df_train,
+            batch_size=batch_size,
+            n_trials=optuna_trials,
+            n_jobs=optuna_jobs,
+            n_folds=optuna_folds,
+            trial_epochs=optuna_epochs,
+            fixed_margin=margin,
+            attention_heads=attention_heads,
+            embedding_dim=embedding_dim,
+            optuna_output_dir=model_output_dir,
+        )
+
+        learning_rate = best["learning_rate"]
+        dropout_rate = best["dropout_rate"]
+        weight_decay = best["weight_decay"]
+        small_kernel_size = best["small_kernel_size"]
+        medium_kernel_size = best["medium_kernel_size"]
+        large_kernel_size = best["large_kernel_size"]
+
+    train_loader_generator = torch.Generator()
+    train_loader_generator.manual_seed(DEFAULT_RANDOM_STATE)
+
+    train_loader = DataLoader(
+        DNAPairDatasetWithMeta(df_train),
+        batch_size=batch_size,
+        shuffle=True,
+        generator=train_loader_generator,
+    )
+
+    val_loader = DataLoader(
+        DNAPairDatasetWithMeta(df_val),
+        batch_size=batch_size,
+        shuffle=False,
+    )
+
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(DEFAULT_RANDOM_STATE)
+        model = SiameseCNN(
+            dropout_rate=dropout_rate,
+            small_kernel_size=small_kernel_size,
+            medium_kernel_size=medium_kernel_size,
+            large_kernel_size=large_kernel_size,
+            attention_heads=attention_heads,
+            embedding_dim=embedding_dim,
+        )
+
+    criterion = ContrastiveLossCosine(margin=margin)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=weight_decay,
+    )
+
+    model_config = {
+        "dropout_rate": float(dropout_rate),
+        "small_kernel_size": int(small_kernel_size),
+        "medium_kernel_size": int(medium_kernel_size),
+        "large_kernel_size": int(large_kernel_size),
+        "attention_heads": int(attention_heads),
+        "embedding_dim": int(embedding_dim),
+        "learning_rate": float(learning_rate),
+        "weight_decay": float(weight_decay),
+        "margin": float(margin),
+        "batch_size": int(batch_size),
+        "epochs": int(num_epochs),
+        "optimized_hyperparameters": bool(optimize_hparams),
+    }
+
+    save_model_config(model_output_dir / "model_config.json", model_config)
+
+    training_summary = f"""
+Training Parameters
+-------------------------
+Batch size: {batch_size}
+Epochs: {num_epochs}
+
+Optimizer: AdamW
+Learning rate: {learning_rate}
+Weight decay: {weight_decay}
+
+Loss function: ContrastiveLossCosine
+Margin: {margin}
+
+Small kernel size: {small_kernel_size}
+Medium kernel size: {medium_kernel_size}
+Large kernel size: {large_kernel_size}
+Attention heads: {attention_heads}
+Embedding dimension: {embedding_dim}
+
+Dropout rate: {dropout_rate}
+Optimized hyperparameters: {optimize_hparams}
+"""
+
+    logger.info(training_summary)
+
+    model = train_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        num_epochs=num_epochs,
+        model_path=model_output_dir / "model_weights.pth",
+        summary_path=model_output_dir / "training_summary.txt",
+        training_summary=training_summary,
+        diagnostics_path=model_output_dir / "epoch_embedding_distances.tsv",
+    )
+
+    plot_epoch_embedding_distances(
+        distances_path=model_output_dir / "epoch_embedding_distances.tsv",
+        output_path=model_output_dir / "train_embedding_distance_dynamics.png",
+        split_name="train",
+    )
+
+    plot_epoch_embedding_distances(
+        distances_path=model_output_dir / "epoch_embedding_distances.tsv",
+        output_path=model_output_dir / "validation_embedding_distance_dynamics.png",
+        split_name="validation",
+    )
+
+    if metric_column is None:
+        metric_column = _guess_metric_column(df_train)
+
+    train_similarity_dataframe = save_embedding_similarity_dataframe(
+        model=model,
+        loader=train_loader,
+        source_dataframe=df_train,
+        output_path=model_output_dir / "train_embedding_similarity.tsv",
+        metric_column=metric_column,
+    )
+
+    validation_similarity_dataframe = save_embedding_similarity_dataframe(
+        model=model,
+        loader=val_loader,
+        source_dataframe=df_val,
+        output_path=model_output_dir / "validation_embedding_similarity.tsv",
+        metric_column=metric_column,
+    )
+
+    plot_embedding_vs_expression_similarity(
+        dataframe=train_similarity_dataframe,
+        metric_column=metric_column,
+        output_path=model_output_dir / "train_embedding_vs_expression.png",
+        title="Training: Embedding vs Expression Similarity",
+    )
+
+    plot_embedding_vs_expression_similarity(
+        dataframe=validation_similarity_dataframe,
+        metric_column=metric_column,
+        output_path=model_output_dir / "validation_embedding_vs_expression.png",
+        title="Validation: Embedding vs Expression Similarity",
+    )
+
+    return model
+
+
+# -----------------------------
+# Main workflow
+# -----------------------------
+def main(cli_args: list[str] | None = None) -> Path:
+    """Run training workflow."""
+
+    args = parse_args(cli_args)
+
+    logger.info("Loading datasets.")
+    df_train = pd.read_csv(args.train, sep="\t")
+    df_val = pd.read_csv(args.validation, sep="\t")
+
+    logger.info("Train=%d | Validation=%d", len(df_train), len(df_val))
+
+    if args.output_dir is None:
+        model_output_dir = OUTPUT_DIR / args.name / "Model"
+    else:
+        model_output_dir = args.output_dir
+
+    model_output_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Starting model training.")
+
+    run_training(
+        df_train=df_train,
+        df_val=df_val,
+        model_output_dir=model_output_dir,
+        batch_size=args.batch_size,
+        margin=args.margin,
+        num_epochs=args.epochs,
+        learning_rate=args.learning_rate,
+        dropout_rate=args.dropout,
+        weight_decay=args.weight_decay,
+        small_kernel_size=args.small_kernel_size,
+        medium_kernel_size=args.medium_kernel_size,
+        large_kernel_size=args.large_kernel_size,
+        attention_heads=args.attention_heads,
+        embedding_dim=args.embedding_dim,
+        optimize_hparams=args.optimize,
+        optuna_trials=args.optuna_trials,
+        optuna_jobs=args.optuna_jobs,
+        optuna_folds=args.optuna_folds,
+        optuna_epochs=args.optuna_epochs,
+        metric_column=args.metric,
+    )
+
+    logger.info("Training completed.")
+
+    return model_output_dir / "model_weights.pth"
+
+
+if __name__ == "__main__":
+    main()

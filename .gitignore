@@ -1,0 +1,40 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment files
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Results and generated outputs
+results/
+outputs/
+logs/
+
+# Data files
+data/
+*.tsv
+*.csv
+*.xlsx
+*.h5
+*.hdf5
+
+# Model artifacts
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.joblib
+
+# System files
+.DS_Store
+Thumbs.db
