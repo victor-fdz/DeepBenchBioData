@@ -20,13 +20,6 @@ results/
 outputs/
 logs/
 
-# Data files
-*.tsv
-*.csv
-*.xlsx
-*.h5
-*.hdf5
-
 # Model artifacts
 *.pth
 *.pt
