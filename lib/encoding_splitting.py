@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 SEQ_LENGTH = 500  # Default promoter sequence length
 
 # External profiling metrics keep their raw column names.
-_EXTERNAL_METRICS = {"cosine_sim", "met", "ssd"}
+_EXTERNAL_METRICS = {"cosine_sim", "met", "ssd", "z_score_cosine_sim"}
 
 # One-hot encoding lookup: rows = nucleotide index, cols = A C G T
 # Index 4 (unknown/N) maps to all-zero row.
