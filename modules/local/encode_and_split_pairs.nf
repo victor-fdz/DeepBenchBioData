@@ -1,20 +1,23 @@
 process ENCODE_AND_SPLIT_PAIRS {
     tag { dataset_name }
 
-    publishDir { "${params.outdir}/${dataset_name}/Encoded" }, mode: params.publish_mode
+    publishDir "${params.outdir}/${dataset_name}/Encoded", mode: params.publish_mode
 
     input:
     tuple val(dataset_name), path(labeled_pairs)
     path human_fasta
     path mouse_fasta
     path original_gene_list
+    path project_lib
 
     output:
     tuple val(dataset_name), path("results/${dataset_name}/splits/${params.split_mode}"), emit: split_directory
 
     script:
+    def random_seqs_flag = params.random_seqs ? '--random-seqs' : ''
     """
-    python ${projectDir}/bin/encode_split.py \
+    export PYTHONPATH="${project_lib}/..:${project_lib}"
+    encode_split.py \
         --input ${labeled_pairs} \
         --name ${dataset_name} \
         --human-fasta ${human_fasta} \
@@ -24,6 +27,7 @@ process ENCODE_AND_SPLIT_PAIRS {
         --gene-list ${original_gene_list} \
         --val-frac ${params.val_frac} \
         --test-frac ${params.test_frac} \
-        --seed ${params.seed}
+        --seed ${params.seed} \
+        ${random_seqs_flag}
     """
 }
