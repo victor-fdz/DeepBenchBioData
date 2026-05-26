@@ -1,2 +1,0 @@
-2026-05-26 13:26:51	-	stupefied_lagrange	-	56fa9034c79e186a8998623b4519b518	64fbd765-7899-4c87-9543-37de66cb8d35	nextflow run main.nf --help
-2026-05-26 13:27:02	3.2s	nasty_gilbert	OK	56fa9034c79e186a8998623b4519b518	72910696-46c5-4a6f-bbf2-da0adb9f275b	nextflow run main.nf --input data/merged_kinases_tpm_humanandmouse.tsv --name test_kinases --human_fasta data/promoter_kinases_human.fasta --mouse_fasta data/promoter_kinases_mouse.fasta -preview
