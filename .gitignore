@@ -21,7 +21,6 @@ outputs/
 logs/
 
 # Data files
-data/
 *.tsv
 *.csv
 *.xlsx
