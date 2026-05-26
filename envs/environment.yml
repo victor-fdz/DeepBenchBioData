@@ -1,0 +1,20 @@
+name: env-tfm
+channels:
+  - conda-forge
+  - bioconda
+  - pytorch
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  - biopython
+  - matplotlib
+  - seaborn
+  - pytorch
+  - optuna
+  - scikit-bio
+  - pip:
+      - pydeseq2
