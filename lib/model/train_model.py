@@ -344,11 +344,9 @@ def optimize_hyperparameters(
     optuna_epoch_loss_rows: list[dict[str, Any]] = []
 
     def objective(trial: optuna.trial.Trial) -> float:
-        learning_rate = trial.suggest_float(
+        learning_rate = trial.suggest_categorical(
             "learning_rate",
-            1e-5,
-            5e-2,
-            log=True,
+            [1e-5, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2],
         )
 
         weight_decay = trial.suggest_categorical(
@@ -356,10 +354,9 @@ def optimize_hyperparameters(
             [0.0, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2],
         )
 
-        dropout_rate = trial.suggest_float(
+        dropout_rate = trial.suggest_categorical(
             "dropout_rate",
-            0.0,
-            0.8,
+            [0.0, 0.1, 0.3, 0.5, 0.6, 0.8],
         )
 
         small_kernel_size = trial.suggest_categorical(
@@ -369,12 +366,12 @@ def optimize_hyperparameters(
 
         medium_kernel_size = trial.suggest_categorical(
             "medium_kernel_size",
-            [10, 12, 16],
+            [10, 12, 14],
         )
 
         large_kernel_size = trial.suggest_categorical(
             "large_kernel_size",
-            [18, 20, 24, 30],
+            [18, 20, 24, 26, 30],
         )
 
         trial_seed = DEFAULT_RANDOM_STATE + trial.number * 1000

@@ -26,8 +26,6 @@ def pairs_exchange(
     df: pd.DataFrame,
     df_name: str,
     output_dir: Path,
-    seed: int | None = None,
-    output_suffix: str = '',
     _retries: int = 0,
 ) -> pd.DataFrame:
     """
@@ -44,8 +42,6 @@ def pairs_exchange(
         - df (pd.DataFrame): Input expression dataframe with human/mouse columns
         - df_name (str): Dataset name (used for output naming)
         - output_dir (Path): Root output directory
-        - seed (int | None): Optional random seed for deterministic shuffling
-        - output_suffix (str): Optional suffix for saved output filename
         - _retries (int): Internal retry counter (do not set manually)
 
     Returns:
@@ -69,13 +65,8 @@ def pairs_exchange(
     mouse = df[mouse_cols].rename(columns={"gene_name": "gene_name_mouse"})
 
     # shuffle independently (break orthology structure)
-    if seed is None:
-        shuffled_human = human.sample(frac=1).reset_index(drop=True)
-        shuffled_mouse = mouse.sample(frac=1).reset_index(drop=True)
-    else:
-        random_generator = np.random.RandomState(seed + _retries)
-        shuffled_human = human.sample(frac=1, random_state=random_generator).reset_index(drop=True)
-        shuffled_mouse = mouse.sample(frac=1, random_state=random_generator).reset_index(drop=True)
+    shuffled_human = human.sample(frac=1).reset_index(drop=True)
+    shuffled_mouse = mouse.sample(frac=1).reset_index(drop=True)
 
     # split expression from identifiers
     expr_human = shuffled_human.drop(columns=["gene_name_human", "gene_id_human"])
@@ -99,17 +90,10 @@ def pairs_exchange(
             "Orthology leak detected (%.2f%%). Retrying shuffle.",
             leak * 100,
         )
-        return pairs_exchange(
-            df,
-            df_name,
-            output_dir,
-            seed=seed,
-            output_suffix=output_suffix,
-            _retries=_retries + 1,
-        )
+        return pairs_exchange(df, df_name, output_dir, _retries=_retries + 1)
 
     # save output
-    out_path = output_dir / df_name / "Intermediate_Datasets" / f"{df_name}_nonOrthologs{output_suffix}.tsv"
+    out_path = output_dir / df_name / "Intermediate_Datasets" / f"{df_name}_nonOrthologs.tsv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     shuffled_df.to_csv(out_path, sep="\t", index=False)
@@ -178,6 +162,107 @@ def all_pairs(df_path: Path, df_name: str, output_dir: Path) -> pd.DataFrame:
 
     return all_pairs_df
 
+
+
+def all_nonortholog_pairs(
+    df: pd.DataFrame,
+    df_name: str,
+    output_dir: Path,
+) -> pd.DataFrame:
+    """
+    Generate all possible human × mouse gene combinations and remove true orthologous pairs.
+
+    This creates a deterministic non-ortholog background without random shuffling.
+    True orthologs are removed using:
+    - original gene_id_human / gene_id_mouse pairs from the input dataframe
+    - matching gene_name_human / gene_name_mouse values, when available
+
+    Args:
+        - df (pd.DataFrame): Input expression dataframe with paired human/mouse ortholog rows
+        - df_name (str): Dataset name used for output naming
+        - output_dir (Path): Root output directory
+
+    Returns:
+        pd.DataFrame: All non-orthologous human × mouse pairs
+    """
+
+    human_cols = [c for c in df.columns if "human" in c] + ["gene_name"]
+    mouse_cols = [c for c in df.columns if "mouse" in c] + ["gene_name"]
+
+    human = df[human_cols].rename(columns={"gene_name": "gene_name_human"})
+    mouse = df[mouse_cols].rename(columns={"gene_name": "gene_name_mouse"})
+
+    all_pairs_df = human.merge(mouse, how="cross")
+
+    original_ortholog_pairs = set(
+        zip(
+            df["gene_id_human"].astype(str),
+            df["gene_id_mouse"].astype(str),
+        )
+    )
+
+    candidate_pairs = list(
+        zip(
+            all_pairs_df["gene_id_human"].astype(str),
+            all_pairs_df["gene_id_mouse"].astype(str),
+        )
+    )
+
+    nonortholog_mask = ~pd.Series(
+        candidate_pairs,
+        index=all_pairs_df.index,
+    ).isin(original_ortholog_pairs)
+
+    if {"gene_name_human", "gene_name_mouse"}.issubset(all_pairs_df.columns):
+        nonortholog_mask = (
+            nonortholog_mask
+            & (all_pairs_df["gene_name_human"] != all_pairs_df["gene_name_mouse"])
+        )
+
+    nonortholog_df = all_pairs_df[nonortholog_mask].reset_index(drop=True)
+
+    meta_human = ["gene_id_human", "gene_name_human"]
+    meta_mouse = ["gene_id_mouse", "gene_name_mouse"]
+
+    tpm_human = [
+        column
+        for column in human.columns
+        if column not in meta_human
+    ]
+
+    tpm_mouse = [
+        column
+        for column in mouse.columns
+        if column not in meta_mouse
+    ]
+
+    column_order = (
+        meta_human[:1]
+        + meta_mouse[:1]
+        + meta_human[1:]
+        + meta_mouse[1:]
+        + tpm_human
+        + tpm_mouse
+    )
+
+    nonortholog_df = nonortholog_df[column_order]
+
+    out_path = (
+        output_dir
+        / df_name
+        / "Intermediate_Datasets"
+        / f"{df_name}_allNonOrthologs.tsv"
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    nonortholog_df.to_csv(out_path, sep="\t", index=False)
+
+    logger.info(
+        "All non-orthologous pairs saved to %s (%d pairs).",
+        out_path,
+        len(nonortholog_df),
+    )
+
+    return nonortholog_df
 
 # -----------------------------
 # Core: same-species pair generation
