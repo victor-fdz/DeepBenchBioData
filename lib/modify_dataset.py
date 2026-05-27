@@ -26,6 +26,8 @@ def pairs_exchange(
     df: pd.DataFrame,
     df_name: str,
     output_dir: Path,
+    seed: int | None = None,
+    output_suffix: str = '',
     _retries: int = 0,
 ) -> pd.DataFrame:
     """
@@ -42,6 +44,8 @@ def pairs_exchange(
         - df (pd.DataFrame): Input expression dataframe with human/mouse columns
         - df_name (str): Dataset name (used for output naming)
         - output_dir (Path): Root output directory
+        - seed (int | None): Optional random seed for deterministic shuffling
+        - output_suffix (str): Optional suffix for saved output filename
         - _retries (int): Internal retry counter (do not set manually)
 
     Returns:
@@ -65,8 +69,13 @@ def pairs_exchange(
     mouse = df[mouse_cols].rename(columns={"gene_name": "gene_name_mouse"})
 
     # shuffle independently (break orthology structure)
-    shuffled_human = human.sample(frac=1).reset_index(drop=True)
-    shuffled_mouse = mouse.sample(frac=1).reset_index(drop=True)
+    if seed is None:
+        shuffled_human = human.sample(frac=1).reset_index(drop=True)
+        shuffled_mouse = mouse.sample(frac=1).reset_index(drop=True)
+    else:
+        random_generator = np.random.RandomState(seed + _retries)
+        shuffled_human = human.sample(frac=1, random_state=random_generator).reset_index(drop=True)
+        shuffled_mouse = mouse.sample(frac=1, random_state=random_generator).reset_index(drop=True)
 
     # split expression from identifiers
     expr_human = shuffled_human.drop(columns=["gene_name_human", "gene_id_human"])
@@ -90,10 +99,17 @@ def pairs_exchange(
             "Orthology leak detected (%.2f%%). Retrying shuffle.",
             leak * 100,
         )
-        return pairs_exchange(df, df_name, output_dir, _retries=_retries + 1)
+        return pairs_exchange(
+            df,
+            df_name,
+            output_dir,
+            seed=seed,
+            output_suffix=output_suffix,
+            _retries=_retries + 1,
+        )
 
     # save output
-    out_path = output_dir / df_name / "Intermediate_Datasets" / f"{df_name}_nonOrthologs.tsv"
+    out_path = output_dir / df_name / "Intermediate_Datasets" / f"{df_name}_nonOrthologs{output_suffix}.tsv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     shuffled_df.to_csv(out_path, sep="\t", index=False)
@@ -203,12 +219,7 @@ def same_species_pairs(
 
     entries = entries.drop_duplicates(subset=[gene_id_column]).reset_index(drop=True)
 
-    n_entries = len(entries)
-    if include_self_pairs:
-        candidate_pairs = n_entries * (n_entries + 1) // 2
-    else:
-        candidate_pairs = n_entries * (n_entries - 1) // 2
-
+    candidate_pairs = len(entries) ** 2
     if candidate_pairs > max_pairs:
         raise ValueError(
             f"Refusing to build {candidate_pairs:,} candidate pairs for {species}. "

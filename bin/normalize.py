@@ -34,6 +34,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 OUTPUT_DIR = Path("results")
+NON_ORTHOLOG_SEED_OFFSETS = [0, 2, 5, 10, 20]
 
 
 # -----------------------------
@@ -69,6 +70,13 @@ def parse_args(cli_args: list[str] | None = None) -> argparse.Namespace:
         "--tissue",
         default="General",
         help="Tissue used for method ranking",
+    )
+
+    parser.add_argument(
+        "--seed",
+        default=0,
+        type=int,
+        help="Base random seed for non-orthologous control generation",
     )
 
     return parser.parse_args(cli_args)
@@ -107,11 +115,6 @@ def main(cli_args: list[str] | None = None) -> str:
     tissues = list({c.rsplit("_", 2)[0] for c in features})
 
     # -----------------------------
-    # Generate non-ortholog dataset
-    # -----------------------------
-    nonortho_df = mod.pairs_exchange(df, args.name, OUTPUT_DIR)
-
-    # -----------------------------
     # Apply normalization
     # -----------------------------
     normfx.apply_normalizations(
@@ -122,23 +125,11 @@ def main(cli_args: list[str] | None = None) -> str:
         output_dir=OUTPUT_DIR,
     )
 
-    normfx.apply_normalizations(
-        df=nonortho_df,
-        df_name=args.name,
-        features=features,
-        orthology="NonOrthologs",
-        output_dir=OUTPUT_DIR,
-    )
-
     # -----------------------------
     # Load normalized datasets
     # -----------------------------
     dfs_ortho, names_ortho = normfx.load_normalized_data(
         args.name, "Orthologs", OUTPUT_DIR
-    )
-
-    dfs_nonortho, names_nonortho = normfx.load_normalized_data(
-        args.name, "NonOrthologs", OUTPUT_DIR
     )
 
     # -----------------------------
@@ -148,14 +139,63 @@ def main(cli_args: list[str] | None = None) -> str:
         dfs_ortho, names_ortho, features, tissues, "Orthologs"
     )
 
-    stats_nonortho = compst.compute_stats(
-        dfs_nonortho, names_nonortho, features, tissues, "NonOrthologs"
-    )
+    replicate_seeds = [
+        args.seed + offset
+        for offset in NON_ORTHOLOG_SEED_OFFSETS
+    ]
 
-    stats_all = compst.merge_and_increment(
+    stats_nonortho_replicates = []
+    dfs_nonortho = None
+    names_nonortho = None
+
+    for replicate_seed in replicate_seeds:
+
+        # -----------------------------
+        # Generate non-ortholog dataset
+        # -----------------------------
+        nonortho_df = mod.pairs_exchange(
+            df,
+            args.name,
+            OUTPUT_DIR,
+            seed=replicate_seed,
+            output_suffix=f"_seed_{replicate_seed}",
+        )
+
+        orthology_name = f"NonOrthologs_seed_{replicate_seed}"
+
+        normfx.apply_normalizations(
+            df=nonortho_df,
+            df_name=args.name,
+            features=features,
+            orthology=orthology_name,
+            output_dir=OUTPUT_DIR,
+        )
+
+        dfs_nonortho_current, names_nonortho_current = normfx.load_normalized_data(
+            args.name,
+            orthology_name,
+            OUTPUT_DIR,
+        )
+
+        stats_nonortho_current = compst.compute_stats(
+            dfs_nonortho_current,
+            names_nonortho_current,
+            features,
+            tissues,
+            orthology_name,
+        )
+
+        stats_nonortho_current["replicate_seed"] = replicate_seed
+        stats_nonortho_replicates.append(stats_nonortho_current)
+
+        if dfs_nonortho is None:
+            dfs_nonortho = dfs_nonortho_current
+            names_nonortho = names_nonortho_current
+
+    stats_all = compst.merge_and_increment_replicates(
         args.name,
         stats_ortho,
-        stats_nonortho,
+        stats_nonortho_replicates,
         OUTPUT_DIR,
     )
 

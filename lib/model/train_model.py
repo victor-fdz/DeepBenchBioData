@@ -21,7 +21,6 @@ import torch.nn.functional as F
 from scipy.stats import kendalltau
 from scipy.stats import pearsonr
 from scipy.stats import spearmanr
-from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader
 
 from lib.model.datasets import DNAPairDatasetWithMeta
@@ -52,7 +51,6 @@ DEFAULT_EMBEDDING_DIM = 16
 
 DEFAULT_OPTUNA_TRIALS = 20
 DEFAULT_OPTUNA_JOBS = 1
-DEFAULT_OPTUNA_FOLDS = 5
 DEFAULT_OPTUNA_EPOCHS = 8
 DEFAULT_RANDOM_STATE = 42
 
@@ -90,7 +88,6 @@ def parse_args(cli_args: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--optimize", action="store_true")
     parser.add_argument("--optuna-trials", type=int, default=DEFAULT_OPTUNA_TRIALS)
     parser.add_argument("--optuna-jobs", type=int, default=DEFAULT_OPTUNA_JOBS)
-    parser.add_argument("--optuna-folds", type=int, default=DEFAULT_OPTUNA_FOLDS)
     parser.add_argument("--optuna-epochs", type=int, default=DEFAULT_OPTUNA_EPOCHS)
 
     return parser.parse_args(cli_args)
@@ -344,6 +341,8 @@ def optimize_hyperparameters(
             logger.warning("Could not reset PyTorch interop threads. Continuing.")
         logger.info("Parallel Optuna enabled. Forced PyTorch threads per trial to 1.")
 
+    optuna_epoch_loss_rows: list[dict[str, Any]] = []
+
     def objective(trial: optuna.trial.Trial) -> float:
         learning_rate = trial.suggest_float(
             "learning_rate",
@@ -423,8 +422,13 @@ def optimize_hyperparameters(
             weight_decay=weight_decay,
         )
 
+        final_train_loss = np.nan
+        final_validation_loss = np.nan
+        best_validation_loss = np.inf
+
         for epoch in range(1, trial_epochs + 1):
             model.train()
+            train_loss = 0.0
 
             for seq1, seq2, labels, *_ in train_loader:
                 optimizer.zero_grad()
@@ -440,22 +444,63 @@ def optimize_hyperparameters(
                 loss.backward()
                 optimizer.step()
 
-        model.eval()
-        validation_loss = 0.0
+                train_loss += loss.item()
 
-        with torch.no_grad():
-            for seq1, seq2, labels, *_ in val_loader:
-                out1, out2 = model(seq1, seq2)
+            mean_train_loss = train_loss / len(train_loader)
 
-                validation_loss += criterion(
-                    out1,
-                    out2,
-                    labels,
-                ).item()
+            model.eval()
+            validation_loss = 0.0
 
-        mean_validation_loss = validation_loss / len(val_loader)
+            with torch.no_grad():
+                for seq1, seq2, labels, *_ in val_loader:
+                    out1, out2 = model(seq1, seq2)
 
-        return float(mean_validation_loss)
+                    validation_loss += criterion(
+                        out1,
+                        out2,
+                        labels,
+                    ).item()
+
+            mean_validation_loss = validation_loss / len(val_loader)
+
+            final_train_loss = mean_train_loss
+            final_validation_loss = mean_validation_loss
+            best_validation_loss = min(best_validation_loss, mean_validation_loss)
+
+            optuna_epoch_loss_rows.append(
+                {
+                    "trial_number": trial.number,
+                    "epoch": epoch,
+                    "train_loss": float(mean_train_loss),
+                    "validation_loss": float(mean_validation_loss),
+                    "learning_rate": float(learning_rate),
+                    "weight_decay": float(weight_decay),
+                    "dropout_rate": float(dropout_rate),
+                    "small_kernel_size": int(small_kernel_size),
+                    "medium_kernel_size": int(medium_kernel_size),
+                    "large_kernel_size": int(large_kernel_size),
+                    "margin": float(fixed_margin),
+                    "attention_heads": int(attention_heads),
+                    "embedding_dim": int(embedding_dim),
+                    "trial_seed": int(trial_seed),
+                }
+            )
+
+            logger.info(
+                "Optuna trial %d | epoch %d/%d | train=%.6f | val=%.6f",
+                trial.number,
+                epoch,
+                trial_epochs,
+                mean_train_loss,
+                mean_validation_loss,
+            )
+
+        trial.set_user_attr("final_train_loss", float(final_train_loss))
+        trial.set_user_attr("final_validation_loss", float(final_validation_loss))
+        trial.set_user_attr("best_validation_loss", float(best_validation_loss))
+        trial.set_user_attr("trial_seed", int(trial_seed))
+
+        return float(final_validation_loss)
 
     study = optuna.create_study(
         direction="minimize",
@@ -481,6 +526,14 @@ def optimize_hyperparameters(
 
         study.trials_dataframe().to_csv(
             optuna_output_dir / "optuna_trials.tsv",
+            sep="\t",
+            index=False,
+        )
+
+        pd.DataFrame(optuna_epoch_loss_rows).sort_values(
+            ["trial_number", "epoch"]
+        ).to_csv(
+            optuna_output_dir / "optuna_epoch_losses.tsv",
             sep="\t",
             index=False,
         )
@@ -741,7 +794,6 @@ def run_training(
     optimize_hparams: bool = False,
     optuna_trials: int = DEFAULT_OPTUNA_TRIALS,
     optuna_jobs: int = DEFAULT_OPTUNA_JOBS,
-    optuna_folds: int = DEFAULT_OPTUNA_FOLDS,
     optuna_epochs: int = DEFAULT_OPTUNA_EPOCHS,
     metric_column: str | None = None,
 ) -> torch.nn.Module:
@@ -949,7 +1001,6 @@ def main(cli_args: list[str] | None = None) -> Path:
         optimize_hparams=args.optimize,
         optuna_trials=args.optuna_trials,
         optuna_jobs=args.optuna_jobs,
-        optuna_folds=args.optuna_folds,
         optuna_epochs=args.optuna_epochs,
         metric_column=args.metric,
     )

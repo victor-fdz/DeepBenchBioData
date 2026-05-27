@@ -129,6 +129,99 @@ def merge_and_increment(
     return stats_all
 
 
+
+
+def merge_and_increment_replicates(
+    df_name: str,
+    stats_ortho: pd.DataFrame,
+    stats_nonortho_replicates: list[pd.DataFrame],
+    output_dir: Path,
+) -> pd.DataFrame:
+    """
+    Merge ortholog statistics with the mean non-ortholog statistics across replicate shuffles.
+
+    Increment definition:
+        increment = ortho - max(0, mean(non-ortho))
+
+    Args:
+        - df_name (str): Dataset name
+        - stats_ortho (pd.DataFrame): Ortholog correlation stats
+        - stats_nonortho_replicates (list[pd.DataFrame]): Non-ortholog stats from replicate shuffles
+        - output_dir (Path): Output directory
+
+    Returns:
+        pd.DataFrame: Merged dataframe with replicate-averaged increment columns
+    """
+
+    stats_nonortho_all = pd.concat(
+        stats_nonortho_replicates,
+        ignore_index=True,
+    )
+
+    stats_nonortho_summary = (
+        stats_nonortho_all
+        .groupby(["tissue", "method"], as_index=False)
+        .agg(
+            Pearson_R_nonortho_mean=("Pearson_R", "mean"),
+            Pearson_R_nonortho_std=("Pearson_R", "std"),
+            Spearman_rho_nonortho_mean=("Spearman_rho", "mean"),
+            Spearman_rho_nonortho_std=("Spearman_rho", "std"),
+            nonortholog_replicates=("replicate_seed", "nunique"),
+        )
+    )
+
+    stats_all = pd.merge(
+        stats_ortho,
+        stats_nonortho_summary,
+        on=["tissue", "method"],
+    )
+
+    stats_all = stats_all.rename(
+        columns={
+            "Pearson_R": "Pearson_R_ortho",
+            "Spearman_rho": "Spearman_rho_ortho",
+        }
+    )
+
+    # Compatibility aliases used by plotting.py for NonOrthologs plots.
+    stats_all["Pearson_R_nonortho"] = stats_all["Pearson_R_nonortho_mean"]
+    stats_all["Spearman_rho_nonortho"] = stats_all["Spearman_rho_nonortho_mean"]
+
+    stats_all["Pearson_R_increment"] = (
+        stats_all["Pearson_R_ortho"]
+        - stats_all["Pearson_R_nonortho_mean"].clip(lower=0)
+    )
+
+    stats_all["Spearman_rho_increment"] = (
+        stats_all["Spearman_rho_ortho"]
+        - stats_all["Spearman_rho_nonortho_mean"].clip(lower=0)
+    )
+
+    out_dir = output_dir / df_name / "Normalization"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    stats_all.to_csv(
+        out_dir / f"{df_name}_stats.tsv",
+        sep="\t",
+        index=False,
+    )
+
+    stats_nonortho_all.to_csv(
+        out_dir / f"{df_name}_nonortholog_replicate_stats.tsv",
+        sep="\t",
+        index=False,
+    )
+
+    stats_nonortho_summary.to_csv(
+        out_dir / f"{df_name}_nonortholog_mean_stats.tsv",
+        sep="\t",
+        index=False,
+    )
+
+    logger.info("Saved replicate-averaged statistics to %s", out_dir)
+
+    return stats_all
+
 # -----------------------------
 # Method selection
 # -----------------------------

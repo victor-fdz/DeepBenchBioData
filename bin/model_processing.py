@@ -41,7 +41,6 @@ DEFAULT_ATTENTION_HEADS = 4
 DEFAULT_EMBEDDING_DIM = 16
 DEFAULT_OPTUNA_TRIALS = 20
 DEFAULT_OPTUNA_JOBS = 1
-DEFAULT_OPTUNA_FOLDS = 5
 DEFAULT_OPTUNA_EPOCHS = 8
 
 
@@ -76,7 +75,6 @@ def parse_args(cli_args: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--optimize", action="store_true")
     parser.add_argument("--optuna-trials", type=int, default=DEFAULT_OPTUNA_TRIALS)
     parser.add_argument("--optuna-jobs", type=int, default=DEFAULT_OPTUNA_JOBS)
-    parser.add_argument("--optuna-folds", type=int, default=DEFAULT_OPTUNA_FOLDS)
     parser.add_argument("--optuna-epochs", type=int, default=DEFAULT_OPTUNA_EPOCHS)
 
     return parser.parse_args(cli_args)
@@ -169,7 +167,6 @@ def main(cli_args: list[str] | None = None) -> Path:
         optimize_hparams=args.optimize,
         optuna_trials=args.optuna_trials,
         optuna_jobs=args.optuna_jobs,
-        optuna_folds=args.optuna_folds,
         optuna_epochs=args.optuna_epochs,
         metric_column=args.metric,
     )
