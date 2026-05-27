@@ -1,3 +1,7 @@
+<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/799c876f-e8e7-42a6-880d-0baa34b70bd4" />
+
+
+
 # Normalization Pipeline
 
 Cross-species gene expression normalization benchmarking pipeline.
