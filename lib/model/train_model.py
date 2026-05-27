@@ -304,17 +304,17 @@ def train_model(
 # -----------------------------
 def optimize_hyperparameters(
     df_train: pd.DataFrame,
+    df_val: pd.DataFrame,
     batch_size: int = DEFAULT_BATCH_SIZE,
     n_trials: int = DEFAULT_OPTUNA_TRIALS,
     n_jobs: int = DEFAULT_OPTUNA_JOBS,
-    n_folds: int = DEFAULT_OPTUNA_FOLDS,
     trial_epochs: int = DEFAULT_OPTUNA_EPOCHS,
     fixed_margin: float = DEFAULT_MARGIN,
     attention_heads: int = DEFAULT_ATTENTION_HEADS,
     embedding_dim: int = DEFAULT_EMBEDDING_DIM,
     optuna_output_dir: Path | None = None,
 ) -> dict[str, Any]:
-    """Run Optuna hyperparameter search using stratified cross-validation."""
+    """Run Optuna hyperparameter search using the external validation set."""
 
     if n_trials <= 0:
         raise ValueError("n_trials must be a positive integer.")
@@ -322,26 +322,17 @@ def optimize_hyperparameters(
     if n_jobs <= 0:
         raise ValueError("n_jobs must be a positive integer.")
 
-    if n_folds < 2:
-        raise ValueError("n_folds must be at least 2.")
-
     if trial_epochs <= 0:
         raise ValueError("trial_epochs must be a positive integer.")
 
-    labels_for_stratification = _prepare_binary_labels_for_stratification(df_train)
-    label_counts = labels_for_stratification.value_counts()
-
-    if label_counts.min() < n_folds:
-        raise ValueError(
-            "n_folds cannot be larger than the smallest label class. "
-            f"Label counts: {dict(label_counts)} | n_folds={n_folds}"
-        )
+    _prepare_binary_labels_for_stratification(df_train)
+    _prepare_binary_labels_for_stratification(df_val)
 
     logger.info(
-        "Running Optuna optimization: trials=%d | jobs=%d | folds=%d | trial_epochs=%d.",
+        "Running Optuna optimization with external validation: "
+        "trials=%d | jobs=%d | trial_epochs=%d.",
         n_trials,
         n_jobs,
-        n_folds,
         trial_epochs,
     )
 
@@ -352,12 +343,6 @@ def optimize_hyperparameters(
         except RuntimeError:
             logger.warning("Could not reset PyTorch interop threads. Continuing.")
         logger.info("Parallel Optuna enabled. Forced PyTorch threads per trial to 1.")
-
-    stratified_splitter = StratifiedKFold(
-        n_splits=n_folds,
-        shuffle=True,
-        random_state=DEFAULT_RANDOM_STATE,
-    )
 
     def objective(trial: optuna.trial.Trial) -> float:
         learning_rate = trial.suggest_float(
@@ -393,87 +378,89 @@ def optimize_hyperparameters(
             [18, 20, 24, 30],
         )
 
-        fold_losses = []
+        trial_seed = DEFAULT_RANDOM_STATE + trial.number * 1000
 
-        for fold_index, (train_idx, val_idx) in enumerate(
-            stratified_splitter.split(df_train, labels_for_stratification)
-        ):
-            trial_seed = DEFAULT_RANDOM_STATE + trial.number * 1000 + fold_index
+        train_loader_generator = torch.Generator()
+        train_loader_generator.manual_seed(trial_seed)
 
-            data_loader_generator = torch.Generator()
-            data_loader_generator.manual_seed(trial_seed)
+        train_loader = DataLoader(
+            DNAPairDatasetWithMeta(df_train),
+            batch_size=batch_size,
+            shuffle=True,
+            generator=train_loader_generator,
+            num_workers=0,
+        )
 
-            fold_train = df_train.iloc[train_idx].copy()
-            fold_val = df_train.iloc[val_idx].copy()
+        val_loader = DataLoader(
+            DNAPairDatasetWithMeta(df_val),
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,
+        )
 
-            train_loader = DataLoader(
-                DNAPairDatasetWithMeta(fold_train),
-                batch_size=batch_size,
-                shuffle=True,
-                generator=data_loader_generator,
-                num_workers=0,
+        _validate_loader_not_empty(train_loader, "Optuna training")
+        _validate_loader_not_empty(val_loader, "Optuna validation")
+
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(trial_seed)
+
+            model = SiameseCNN(
+                dropout_rate=dropout_rate,
+                small_kernel_size=small_kernel_size,
+                medium_kernel_size=medium_kernel_size,
+                large_kernel_size=large_kernel_size,
+                attention_heads=attention_heads,
+                embedding_dim=embedding_dim,
             )
 
-            val_loader = DataLoader(
-                DNAPairDatasetWithMeta(fold_val),
-                batch_size=batch_size,
-                shuffle=False,
-                num_workers=0,
-            )
+        criterion = ContrastiveLossCosine(
+            margin=fixed_margin,
+        )
 
-            with torch.random.fork_rng(devices=[]):
-                torch.manual_seed(trial_seed)
-                model = SiameseCNN(
-                    dropout_rate=dropout_rate,
-                    small_kernel_size=small_kernel_size,
-                    medium_kernel_size=medium_kernel_size,
-                    large_kernel_size=large_kernel_size,
-                    attention_heads=attention_heads,
-                    embedding_dim=embedding_dim,
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay,
+        )
+
+        for epoch in range(1, trial_epochs + 1):
+            model.train()
+
+            for seq1, seq2, labels, *_ in train_loader:
+                optimizer.zero_grad()
+
+                out1, out2 = model(seq1, seq2)
+
+                loss = criterion(
+                    out1,
+                    out2,
+                    labels,
                 )
 
-            criterion = ContrastiveLossCosine(margin=fixed_margin)
+                loss.backward()
+                optimizer.step()
 
-            optimizer = torch.optim.AdamW(
-                model.parameters(),
-                lr=learning_rate,
-                weight_decay=weight_decay,
-            )
+        model.eval()
+        validation_loss = 0.0
 
-            for _ in range(trial_epochs):
-                model.train()
+        with torch.no_grad():
+            for seq1, seq2, labels, *_ in val_loader:
+                out1, out2 = model(seq1, seq2)
 
-                for seq1, seq2, labels, *_ in train_loader:
-                    optimizer.zero_grad()
-                    out1, out2 = model(seq1, seq2)
+                validation_loss += criterion(
+                    out1,
+                    out2,
+                    labels,
+                ).item()
 
-                    loss = criterion(
-                        out1,
-                        out2,
-                        labels,
-                    )
+        mean_validation_loss = validation_loss / len(val_loader)
 
-                    loss.backward()
-                    optimizer.step()
+        return float(mean_validation_loss)
 
-            model.eval()
-            val_loss = 0.0
+    study = optuna.create_study(
+        direction="minimize",
+    )
 
-            with torch.no_grad():
-                for seq1, seq2, labels, *_ in val_loader:
-                    out1, out2 = model(seq1, seq2)
-
-                    val_loss += criterion(
-                        out1,
-                        out2,
-                        labels,
-                    ).item()
-
-            fold_losses.append(val_loss / len(val_loader))
-
-        return float(np.mean(fold_losses))
-
-    study = optuna.create_study(direction="minimize")
     study.optimize(
         objective,
         n_trials=n_trials,
@@ -486,7 +473,10 @@ def optimize_hyperparameters(
     if optuna_output_dir is not None:
         optuna_output_dir.mkdir(parents=True, exist_ok=True)
 
-        with (optuna_output_dir / "optuna_best_params.json").open("w", encoding="utf-8") as handle:
+        with (optuna_output_dir / "optuna_best_params.json").open(
+            "w",
+            encoding="utf-8",
+        ) as handle:
             json.dump(study.best_params, handle, indent=2)
 
         study.trials_dataframe().to_csv(
@@ -496,7 +486,6 @@ def optimize_hyperparameters(
         )
 
     return study.best_params
-
 
 # -----------------------------
 # Plots
@@ -763,10 +752,10 @@ def run_training(
     if optimize_hparams:
         best = optimize_hyperparameters(
             df_train=df_train,
+            df_val=df_val,
             batch_size=batch_size,
             n_trials=optuna_trials,
             n_jobs=optuna_jobs,
-            n_folds=optuna_folds,
             trial_epochs=optuna_epochs,
             fixed_margin=margin,
             attention_heads=attention_heads,
