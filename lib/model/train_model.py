@@ -9,6 +9,7 @@ import logging
 import sys
 from pathlib import Path
 from typing import Any
+import copy
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -48,6 +49,8 @@ DEFAULT_KERNEL_SIZE_MEDIUM = 12
 DEFAULT_KERNEL_SIZE_LARGE = 20
 DEFAULT_ATTENTION_HEADS = 4
 DEFAULT_EMBEDDING_DIM = 16
+DEFAULT_EARLY_STOPPING_PATIENCE = 3
+DEFAULT_EARLY_STOPPING_MIN_DELTA = 0.00001
 
 DEFAULT_OPTUNA_TRIALS = 20
 DEFAULT_OPTUNA_JOBS = 1
@@ -203,11 +206,19 @@ def train_model(
     summary_path: Path,
     training_summary: str,
     diagnostics_path: Path | None = None,
+    early_stopping_patience: int = 20,
+    early_stopping_min_delta: float = 0.0,
 ) -> torch.nn.Module:
-    """Train Siamese model."""
+    """Train Siamese model with epoch 0 diagnostics and early stopping."""
 
     if num_epochs <= 0:
         raise ValueError("num_epochs must be a positive integer.")
+
+    if early_stopping_patience <= 0:
+        raise ValueError("early_stopping_patience must be a positive integer.")
+
+    if early_stopping_min_delta < 0:
+        raise ValueError("early_stopping_min_delta must be >= 0.")
 
     _validate_loader_not_empty(train_loader, "Training")
     _validate_loader_not_empty(val_loader, "Validation")
@@ -216,14 +227,21 @@ def train_model(
 
     diagnostic_rows = []
 
+    best_validation_loss = float("inf")
+    best_epoch = 0
+    best_model_state = copy.deepcopy(model.state_dict())
+    epochs_without_improvement = 0
+
     for epoch in range(0, num_epochs + 1):
-        
+        should_stop = False
+
         if epoch > 0:
             model.train()
             train_loss = 0.0
 
             for seq1, seq2, labels, *_ in train_loader:
                 optimizer.zero_grad()
+
                 output1, output2 = model(seq1, seq2)
 
                 loss = criterion(
@@ -234,7 +252,10 @@ def train_model(
 
                 loss.backward()
                 optimizer.step()
+
                 train_loss += loss.item()
+
+            avg_train_loss = train_loss / len(train_loader)
 
             model.eval()
             val_loss = 0.0
@@ -249,7 +270,6 @@ def train_model(
                         labels,
                     ).item()
 
-            avg_train_loss = train_loss / len(train_loader)
             avg_val_loss = val_loss / len(val_loader)
 
             logger.info(
@@ -258,10 +278,28 @@ def train_model(
                 avg_train_loss,
                 avg_val_loss,
             )
-        
-        # -----------------------------
-        # Diagnostics for epoch 0 and all trained epochs
-        # -----------------------------
+
+            improved = avg_val_loss < (
+                best_validation_loss - early_stopping_min_delta
+            )
+
+            if improved:
+                best_validation_loss = avg_val_loss
+                best_epoch = epoch
+                best_model_state = copy.deepcopy(model.state_dict())
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+
+            if epochs_without_improvement >= early_stopping_patience:
+                should_stop = True
+                logger.info(
+                    "Early stopping at epoch %d. Best epoch=%d | best val=%.6f",
+                    epoch,
+                    best_epoch,
+                    best_validation_loss,
+                )
+
         if diagnostics_path is not None:
             diagnostic_rows.extend(
                 collect_epoch_embedding_distances(
@@ -272,18 +310,26 @@ def train_model(
                 )
             )
 
-        diagnostic_rows.extend(
-            collect_epoch_embedding_distances(
-                model=model,
-                loader=val_loader,
-                split_name="validation",
-                epoch=epoch,
+            diagnostic_rows.extend(
+                collect_epoch_embedding_distances(
+                    model=model,
+                    loader=val_loader,
+                    split_name="validation",
+                    epoch=epoch,
+                )
             )
-        )
 
+        if should_stop:
+            break
+
+    model.load_state_dict(best_model_state)
 
     model_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(model.state_dict(), model_path)
+
+    torch.save(
+        model.state_dict(),
+        model_path,
+    )
 
     with summary_path.open("w", encoding="utf-8") as handle:
         handle.write(training_summary)
@@ -297,7 +343,12 @@ def train_model(
 
         logger.info("Epoch embedding distances saved to %s", diagnostics_path)
 
-    logger.info("Model weights saved to %s", model_path)
+    logger.info(
+        "Model weights saved to %s. Restored best epoch=%d | best val=%.6f",
+        model_path,
+        best_epoch,
+        best_validation_loss,
+    )
 
     return model
 
@@ -1052,27 +1103,27 @@ def run_training(
     save_model_config(model_output_dir / "model_config.json", model_config)
 
     training_summary = f"""
-Training Parameters
--------------------------
-Batch size: {batch_size}
-Epochs: {num_epochs}
+        Training Parameters
+        -------------------------
+        Batch size: {batch_size}
+        Epochs: {num_epochs}
 
-Optimizer: AdamW
-Learning rate: {learning_rate}
-Weight decay: {weight_decay}
+        Optimizer: AdamW
+        Learning rate: {learning_rate}
+        Weight decay: {weight_decay}
 
-Loss function: ContrastiveLossCosine
-Margin: {margin}
+        Loss function: ContrastiveLossCosine
+        Margin: {margin}
 
-Small kernel size: {small_kernel_size}
-Medium kernel size: {medium_kernel_size}
-Large kernel size: {large_kernel_size}
-Attention heads: {attention_heads}
-Embedding dimension: {embedding_dim}
+        Small kernel size: {small_kernel_size}
+        Medium kernel size: {medium_kernel_size}
+        Large kernel size: {large_kernel_size}
+        Attention heads: {attention_heads}
+        Embedding dimension: {embedding_dim}
 
-Dropout rate: {dropout_rate}
-Optimized hyperparameters: {optimize_hparams}
-"""
+        Dropout rate: {dropout_rate}
+        Optimized hyperparameters: {optimize_hparams}
+        """
 
     logger.info(training_summary)
 
@@ -1087,6 +1138,8 @@ Optimized hyperparameters: {optimize_hparams}
         summary_path=model_output_dir / "training_summary.txt",
         training_summary=training_summary,
         diagnostics_path=model_output_dir / "epoch_embedding_distances.tsv",
+        early_stopping_patience=DEFAULT_EARLY_STOPPING_PATIENCE,
+        early_stopping_min_delta=DEFAULT_EARLY_STOPPING_MIN_DELTA,
     )
 
     plot_epoch_embedding_distances(
@@ -1173,6 +1226,8 @@ def main(cli_args: list[str] | None = None) -> Path:
         optuna_jobs=args.optuna_jobs,
         optuna_epochs=args.optuna_epochs,
         metric_column=args.metric,
+        early_stopping_patience=3,
+        early_stopping_min_delta=0.00001,
     )
 
     logger.info("Training completed.")
