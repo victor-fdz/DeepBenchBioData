@@ -10,8 +10,10 @@ import sys
 from pathlib import Path
 from typing import Any
 import copy
+import os
+import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -33,6 +35,7 @@ logging.basicConfig(
     format="\033[1;32m%(levelname)s\033[0m | "
            "\033[1;36m%(name)s\033[0m | %(message)s",
 )
+
 
 logger = logging.getLogger(__name__)
 
