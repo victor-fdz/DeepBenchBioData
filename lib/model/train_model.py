@@ -543,43 +543,36 @@ def optimize_hyperparameters(
 def plot_epoch_embedding_distances(
     distances_path: Path,
     output_path: Path | None = None,
-    split_name: str = "train",
 ) -> Path:
-    """Plot mean embedding cosine distance across epochs for P/N pairs."""
+    """Plot mean embedding cosine distance for train and validation splits."""
 
-    df = pd.read_csv(distances_path, sep="\t")
+    distance_dataframe = pd.read_csv(distances_path, sep="\t")
 
-    required_cols = {
+    required_columns = {
         "epoch",
         "split",
         "label",
         "mean_cosine_distance",
     }
 
-    missing_cols = required_cols - set(df.columns)
-    if missing_cols:
+    missing_columns = required_columns - set(distance_dataframe.columns)
+    if missing_columns:
         raise ValueError(
-            f"Missing required columns in {distances_path}: {sorted(missing_cols)}"
+            f"Missing required columns in {distances_path}: {sorted(missing_columns)}"
         )
 
-    df = df[df["split"] == split_name].copy()
-
-    if df.empty:
-        raise ValueError(f"No rows found for split={split_name!r} in {distances_path}")
-
-    positive = df[df["label"].isin(["P", 1, "1"])].sort_values("epoch").copy()
-    negative = df[df["label"].isin(["N", 0, "0"])].sort_values("epoch").copy()
-
-    positive["plot_distance"] = positive["mean_cosine_distance"]
-    negative["plot_distance"] = 2 - negative["mean_cosine_distance"]
-
-    if positive.empty or negative.empty:
-        raise ValueError("Both positive and negative rows are required for plotting.")
-
     if output_path is None:
-        output_path = distances_path.parent / f"{split_name}_embedding_distance_dynamics.png"
+        output_path = distances_path.parent / "embedding_distance_dynamics.png"
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    plot_splits = [
+        ("train", "Training"),
+        ("validation", "Validation"),
+    ]
 
     plt.rcParams.update(
         {
@@ -594,45 +587,82 @@ def plot_epoch_embedding_distances(
         }
     )
 
-    fig, ax = plt.subplots(figsize=(3.4, 2.4))
-
-    ax.plot(
-        positive["epoch"],
-        positive["plot_distance"],
-        color="green",
-        linewidth=2.2,
-        marker="o",
-        markersize=3.5,
-        label="Positive pairs",
+    figure, axes = plt.subplots(
+        nrows=1,
+        ncols=2,
+        figsize=(7.2, 2.8),
+        sharey=True,
     )
 
-    ax.plot(
-        negative["epoch"],
-        negative["plot_distance"],
-        color="red",
-        linewidth=2.2,
-        marker="o",
-        markersize=3.5,
-        label="Negative pairs",
+    for axis, (split_name, plot_title) in zip(axes, plot_splits):
+        split_dataframe = distance_dataframe[
+            distance_dataframe["split"] == split_name
+        ].copy()
+
+        if split_dataframe.empty:
+            raise ValueError(
+                f"No rows found for split={split_name!r} in {distances_path}"
+            )
+
+        positive_dataframe = split_dataframe[
+            split_dataframe["label"].isin(["P", 1, "1"])
+        ].sort_values("epoch")
+
+        negative_dataframe = split_dataframe[
+            split_dataframe["label"].isin(["N", 0, "0"])
+        ].sort_values("epoch")
+
+        if positive_dataframe.empty or negative_dataframe.empty:
+            raise ValueError(
+                f"Both positive and negative rows are required for split={split_name!r}."
+            )
+
+        axis.plot(
+            positive_dataframe["epoch"],
+            positive_dataframe["mean_cosine_distance"],
+            linewidth=2.0,
+            marker="o",
+            markersize=3.5,
+            label="Positive pairs",
+        )
+
+        axis.plot(
+            negative_dataframe["epoch"],
+            negative_dataframe["mean_cosine_distance"],
+            linewidth=2.0,
+            marker="o",
+            markersize=3.5,
+            label="Negative pairs",
+        )
+
+        axis.set_title(plot_title)
+        axis.set_xlabel("Epoch")
+        axis.set_ylabel("Mean embedding distance")
+
+        axis.spines["top"].set_visible(False)
+        axis.spines["right"].set_visible(False)
+        axis.grid(
+            True,
+            axis="y",
+            linestyle="--",
+            linewidth=0.6,
+            alpha=0.35,
+        )
+
+    axes[1].set_ylabel("")
+    axes[0].legend(frameon=False, loc="best")
+
+    figure.tight_layout()
+    figure.savefig(
+        output_path,
+        dpi=600,
+        bbox_inches="tight",
     )
-
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Pulling / pushing score")
-    ax.set_title(f"Embedding distance dynamics ({split_name})")
-
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.35)
-    ax.legend(frameon=False, loc="best")
-
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=600, bbox_inches="tight")
-    plt.close(fig)
+    plt.close(figure)
 
     logger.info("Embedding distance dynamics plot saved to %s", output_path)
 
     return output_path
-
 
 def _guess_metric_column(dataframe: pd.DataFrame) -> str:
     candidates = [
@@ -911,14 +941,7 @@ Optimized hyperparameters: {optimize_hparams}
 
     plot_epoch_embedding_distances(
         distances_path=model_output_dir / "epoch_embedding_distances.tsv",
-        output_path=model_output_dir / "train_embedding_distance_dynamics.png",
-        split_name="train",
-    )
-
-    plot_epoch_embedding_distances(
-        distances_path=model_output_dir / "epoch_embedding_distances.tsv",
-        output_path=model_output_dir / "validation_embedding_distance_dynamics.png",
-        split_name="validation",
+        output_path=model_output_dir / "embedding_distance_dynamics.png",
     )
 
     if metric_column is None:

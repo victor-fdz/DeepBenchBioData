@@ -190,20 +190,12 @@ def plot_embedding_vs_expression(
     metric: str,
     output_path: Path,
 ) -> None:
-    """Generate embedding-vs-expression scatter plot."""
-
-    required_columns = {"embedding_cosine_sim", metric}
-    missing_columns = required_columns - set(df.columns)
-
-    if missing_columns:
-        raise ValueError(f"Missing columns for evaluation plot: {sorted(missing_columns)}")
+    """Generate embedding-vs-expression scatter plot with label-wise distances."""
 
     x = df["embedding_cosine_sim"].to_numpy(dtype=float)
     y = df[metric].to_numpy(dtype=float)
 
     stats = compute_correlations(x, y)
-
-    plt.figure(figsize=(6, 5))
 
     label_column = None
     if "original_label" in df.columns:
@@ -211,10 +203,12 @@ def plot_embedding_vs_expression(
     elif "label" in df.columns:
         label_column = "label"
 
-    if label_column is None:
-        plt.scatter(x, y, alpha=0.2, s=6)
-    else:
-        labels_normalized = df[label_column].replace(
+    distance_text = "Mean distance: unavailable"
+
+    if label_column is not None:
+        plot_dataframe = df.copy()
+
+        plot_dataframe["label_normalized"] = plot_dataframe[label_column].replace(
             {
                 "1": "P",
                 1: "P",
@@ -225,6 +219,34 @@ def plot_embedding_vs_expression(
             }
         )
 
+        plot_dataframe["embedding_distance"] = (
+            1.0 - plot_dataframe["embedding_cosine_sim"].astype(float)
+        )
+
+        mean_distances = (
+            plot_dataframe
+            .groupby("label_normalized")["embedding_distance"]
+            .mean()
+            .to_dict()
+        )
+
+        distance_text = (
+            "Mean distance: "
+            f"P={mean_distances.get('P', np.nan):.3f} | "
+            f"N={mean_distances.get('N', np.nan):.3f} | "
+            f"U={mean_distances.get('U', np.nan):.3f}"
+        )
+
+    plt.figure(figsize=(6, 5))
+
+    if label_column is None:
+        plt.scatter(
+            x,
+            y,
+            alpha=0.2,
+            s=6,
+        )
+    else:
         plot_specs = [
             ("U", "blue", "Undefined"),
             ("P", "green", "Positive"),
@@ -232,7 +254,10 @@ def plot_embedding_vs_expression(
         ]
 
         for label_value, colour, label_name in plot_specs:
-            subset = df[labels_normalized == label_value]
+            subset = plot_dataframe[
+                plot_dataframe["label_normalized"] == label_value
+            ]
+
             if subset.empty:
                 continue
 
@@ -245,30 +270,55 @@ def plot_embedding_vs_expression(
                 label=f"{label_name} (n={len(subset)})",
             )
 
-        plt.legend(fontsize=9, frameon=False)
+        plt.legend(
+            fontsize=9,
+            frameon=False,
+        )
 
-    plt.xlabel("Embedding cosine similarity", fontsize=13)
-    plt.ylabel(f"Expression similarity ({metric})", fontsize=13)
+    plt.xlabel(
+        "Embedding cosine similarity",
+        fontsize=13,
+    )
+
+    plt.ylabel(
+        f"Expression similarity ({metric})",
+        fontsize=13,
+    )
+
     plt.title(
         (
             "Embedding vs Expression Similarity\n"
             f"Pearson={stats['pearson']:.3f} | "
             f"Spearman={stats['spearman']:.3f} | "
-            f"Kendall={stats['kendall']:.3f}"
+            f"Kendall={stats['kendall']:.3f}\n"
+            f"{distance_text}"
         ),
-        fontsize=14,
+        fontsize=13,
     )
+
     plt.xticks(fontsize=11)
     plt.yticks(fontsize=11)
+
     plt.tight_layout()
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=300)
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    plt.savefig(
+        output_path,
+        dpi=300,
+    )
+
     plt.close()
 
-    logger.info("Evaluation plot saved to %s", output_path)
+    logger.info(
+        "Evaluation plot saved to %s",
+        output_path,
+    )
 
-
+    
 def build_target_dataframe(
     df: pd.DataFrame,
     metric: str,
