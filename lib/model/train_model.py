@@ -216,47 +216,52 @@ def train_model(
 
     diagnostic_rows = []
 
-    for epoch in range(1, num_epochs + 1):
-        model.train()
-        train_loss = 0.0
+    for epoch in range(0, num_epochs + 1):
+        
+        if epoch > 0:
+            model.train()
+            train_loss = 0.0
 
-        for seq1, seq2, labels, *_ in train_loader:
-            optimizer.zero_grad()
-            output1, output2 = model(seq1, seq2)
-
-            loss = criterion(
-                output1,
-                output2,
-                labels,
-            )
-
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
-
-        model.eval()
-        val_loss = 0.0
-
-        with torch.no_grad():
-            for seq1, seq2, labels, *_ in val_loader:
+            for seq1, seq2, labels, *_ in train_loader:
+                optimizer.zero_grad()
                 output1, output2 = model(seq1, seq2)
 
-                val_loss += criterion(
+                loss = criterion(
                     output1,
                     output2,
                     labels,
-                ).item()
+                )
 
-        avg_train_loss = train_loss / len(train_loader)
-        avg_val_loss = val_loss / len(val_loader)
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item()
 
-        logger.info(
-            "Epoch %d | train=%.4f | val=%.4f",
-            epoch,
-            avg_train_loss,
-            avg_val_loss,
-        )
+            model.eval()
+            val_loss = 0.0
 
+            with torch.no_grad():
+                for seq1, seq2, labels, *_ in val_loader:
+                    output1, output2 = model(seq1, seq2)
+
+                    val_loss += criterion(
+                        output1,
+                        output2,
+                        labels,
+                    ).item()
+
+            avg_train_loss = train_loss / len(train_loader)
+            avg_val_loss = val_loss / len(val_loader)
+
+            logger.info(
+                "Epoch %d | train=%.4f | val=%.4f",
+                epoch,
+                avg_train_loss,
+                avg_val_loss,
+            )
+        
+        # -----------------------------
+        # Diagnostics for epoch 0 and all trained epochs
+        # -----------------------------
         if diagnostics_path is not None:
             diagnostic_rows.extend(
                 collect_epoch_embedding_distances(
@@ -267,14 +272,15 @@ def train_model(
                 )
             )
 
-            diagnostic_rows.extend(
-                collect_epoch_embedding_distances(
-                    model=model,
-                    loader=val_loader,
-                    split_name="validation",
-                    epoch=epoch,
-                )
+        diagnostic_rows.extend(
+            collect_epoch_embedding_distances(
+                model=model,
+                loader=val_loader,
+                split_name="validation",
+                epoch=epoch,
             )
+        )
+
 
     model_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), model_path)
@@ -536,6 +542,127 @@ def optimize_hyperparameters(
         )
 
     return study.best_params
+
+
+
+# ============================= 
+# Pre-training analyses
+# =============================
+def save_untrained_test_embedding_distances(
+    model: torch.nn.Module,
+    df_test: pd.DataFrame,
+    batch_size: int,
+    output_path: Path,
+) -> pd.DataFrame:
+    """Embed test pairs with an untrained model and summarize distances by label."""
+
+    test_loader = DataLoader(
+        DNAPairDatasetWithMeta(df_test),
+        batch_size=batch_size,
+        shuffle=False,
+    )
+
+    _validate_loader_not_empty(test_loader, "Untrained test sanity check")
+
+    model.eval()
+
+    rows = []
+
+    with torch.no_grad():
+        for seq1, seq2, labels, pair_row_id, gene_id_1, gene_id_2 in test_loader:
+            output1, output2 = model(seq1, seq2)
+
+            embedding_distance = (
+                1.0 - F.cosine_similarity(output1, output2)
+            ).cpu().numpy()
+
+            for row_id, first_gene, second_gene, label, distance in zip(
+                pair_row_id,
+                gene_id_1,
+                gene_id_2,
+                labels,
+                embedding_distance,
+            ):
+                rows.append(
+                    {
+                        "pair_row_id": int(row_id),
+                        "gene_id_1": first_gene,
+                        "gene_id_2": second_gene,
+                        "label": int(label.item()),
+                        "embedding_distance": float(distance),
+                    }
+                )
+
+    distance_dataframe = pd.DataFrame(rows)
+
+    metadata_columns = ["pair_row_id"]
+
+    if "original_label" in df_test.columns:
+        metadata_columns.append("original_label")
+
+    metadata_dataframe = df_test[metadata_columns].copy()
+
+    distance_dataframe = distance_dataframe.merge(
+        metadata_dataframe,
+        on="pair_row_id",
+        how="left",
+    )
+
+    if "original_label" in distance_dataframe.columns:
+        group_column = "original_label"
+    else:
+        group_column = "label"
+
+    summary_dataframe = (
+        distance_dataframe
+        .groupby(group_column, dropna=False)["embedding_distance"]
+        .agg(["mean", "std", "count"])
+        .reset_index()
+        .rename(
+            columns={
+                group_column: "label_group",
+                "mean": "mean_embedding_distance",
+                "std": "std_embedding_distance",
+                "count": "n_pairs",
+            }
+        )
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    distance_dataframe.to_csv(
+        output_path,
+        sep="\t",
+        index=False,
+    )
+
+    summary_path = output_path.with_name(
+        output_path.stem + "_summary.tsv"
+    )
+
+    summary_dataframe.to_csv(
+        summary_path,
+        sep="\t",
+        index=False,
+    )
+
+    logger.info(
+        "Untrained test embedding distances saved to %s",
+        output_path,
+    )
+
+    logger.info(
+        "Untrained test embedding distance summary saved to %s",
+        summary_path,
+    )
+
+    logger.info(
+        "Untrained test distance summary:\n%s",
+        summary_dataframe.to_string(index=False),
+    )
+
+    return summary_dataframe
+
 
 # -----------------------------
 # Plots
@@ -806,6 +933,7 @@ def save_model_config(
 def run_training(
     df_train: pd.DataFrame,
     df_val: pd.DataFrame,
+    df_test: pd.DataFrame,
     model_output_dir: Path,
     batch_size: int = DEFAULT_BATCH_SIZE,
     margin: float = DEFAULT_MARGIN,
@@ -849,6 +977,28 @@ def run_training(
         medium_kernel_size = best["medium_kernel_size"]
         large_kernel_size = best["large_kernel_size"]
 
+
+    if df_test is not None:
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(DEFAULT_RANDOM_STATE)
+
+            untrained_model = SiameseCNN(
+                dropout_rate=dropout_rate,
+                small_kernel_size=small_kernel_size,
+                medium_kernel_size=medium_kernel_size,
+                large_kernel_size=large_kernel_size,
+                attention_heads=attention_heads,
+                embedding_dim=embedding_dim,
+            )
+
+        save_untrained_test_embedding_distances(
+            model=untrained_model,
+            df_test=df_test,
+            batch_size=batch_size,
+            output_path=model_output_dir / "untrained_test_embedding_distances.tsv",
+        )
+
+    # Train with optimized hyperparameters (or default if optimization is disabled)
     train_loader_generator = torch.Generator()
     train_loader_generator.manual_seed(DEFAULT_RANDOM_STATE)
 

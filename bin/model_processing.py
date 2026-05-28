@@ -152,6 +152,7 @@ def main(cli_args: list[str] | None = None) -> Path:
     model = run_training(
         df_train=df_train,
         df_val=df_val,
+        df_test=df_test,
         model_output_dir=model_dir,
         batch_size=args.batch_size,
         margin=args.margin,
