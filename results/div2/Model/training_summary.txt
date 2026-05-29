@@ -1,0 +1,22 @@
+
+        Training Parameters
+        -------------------------
+        Batch size: 32
+        Epochs: 15
+
+        Optimizer: AdamW
+        Learning rate: 1e-05
+        Weight decay: 0.001
+
+        Loss function: ContrastiveLossCosine
+        Margin: 1.0
+
+        Small kernel size: 6
+        Medium kernel size: 10
+        Large kernel size: 18
+        Attention heads: 4
+        Embedding dimension: 16
+
+        Dropout rate: 0.0
+        Optimized hyperparameters: False
+        
