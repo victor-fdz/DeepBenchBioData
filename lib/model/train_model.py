@@ -10,10 +10,8 @@ import sys
 from pathlib import Path
 from typing import Any
 import copy
-import os
-import sys
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -36,20 +34,22 @@ logging.basicConfig(
            "\033[1;36m%(name)s\033[0m | %(message)s",
 )
 
+import os
+import sys
 
 logger = logging.getLogger(__name__)
 
 OUTPUT_DIR = Path("results")
 
 DEFAULT_BATCH_SIZE = 32
-DEFAULT_NUM_EPOCHS = 6
-DEFAULT_LEARNING_RATE = 0.032
-DEFAULT_MARGIN = 1.41
-DEFAULT_DROPOUT = 0.26
-DEFAULT_WEIGHT_DECAY = 7.66e-5
+DEFAULT_NUM_EPOCHS = 10
+DEFAULT_LEARNING_RATE = 1e-5
+DEFAULT_MARGIN = 1.0
+DEFAULT_DROPOUT = 0
+DEFAULT_WEIGHT_DECAY = 0.001
 DEFAULT_KERNEL_SIZE_SMALL = 6
-DEFAULT_KERNEL_SIZE_MEDIUM = 12
-DEFAULT_KERNEL_SIZE_LARGE = 20
+DEFAULT_KERNEL_SIZE_MEDIUM = 10
+DEFAULT_KERNEL_SIZE_LARGE = 18
 DEFAULT_ATTENTION_HEADS = 4
 DEFAULT_EMBEDDING_DIM = 16
 DEFAULT_EARLY_STOPPING_PATIENCE = 3
@@ -74,6 +74,7 @@ def parse_args(cli_args: list[str] | None = None) -> argparse.Namespace:
 
     parser.add_argument("--train", required=True, type=Path)
     parser.add_argument("--validation", required=True, type=Path)
+    parser.add_argument("--test", type=Path, default=None)
     parser.add_argument("--name", required=True)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--metric", default=None)
@@ -845,25 +846,6 @@ def plot_epoch_embedding_distances(
 
     return output_path
 
-def _guess_metric_column(dataframe: pd.DataFrame) -> str:
-    candidates = [
-        "cosine_sim",
-        "met",
-        "ssd",
-        "net_sim",
-        "shannon_sim",
-        "tau_sim",
-        "z_score_cosine_sim",
-        "gini_sim",
-    ]
-
-    for column in candidates:
-        if column in dataframe.columns:
-            return column
-
-    raise ValueError("Could not infer expression similarity metric column.")
-
-
 def save_embedding_similarity_dataframe(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -1150,8 +1132,6 @@ def run_training(
         output_path=model_output_dir / "embedding_distance_dynamics.png",
     )
 
-    if metric_column is None:
-        metric_column = _guess_metric_column(df_train)
 
     train_similarity_dataframe = save_embedding_similarity_dataframe(
         model=model,
@@ -1197,8 +1177,9 @@ def main(cli_args: list[str] | None = None) -> Path:
     logger.info("Loading datasets.")
     df_train = pd.read_csv(args.train, sep="\t")
     df_val = pd.read_csv(args.validation, sep="\t")
+    df_test = pd.read_csv(args.test, sep="\t")
 
-    logger.info("Train=%d | Validation=%d", len(df_train), len(df_val))
+    logger.info("Train=%d | Validation=%d | Test=%d", len(df_train), len(df_val), len(df_test))
 
     if args.output_dir is None:
         model_output_dir = OUTPUT_DIR / args.name / "Model"
@@ -1212,6 +1193,7 @@ def main(cli_args: list[str] | None = None) -> Path:
     run_training(
         df_train=df_train,
         df_val=df_val,
+        df_test=df_test,
         model_output_dir=model_output_dir,
         batch_size=args.batch_size,
         margin=args.margin,
@@ -1229,8 +1211,6 @@ def main(cli_args: list[str] | None = None) -> Path:
         optuna_jobs=args.optuna_jobs,
         optuna_epochs=args.optuna_epochs,
         metric_column=args.metric,
-        early_stopping_patience=3,
-        early_stopping_min_delta=0.00001,
     )
 
     logger.info("Training completed.")

@@ -8,9 +8,11 @@ import json
 import logging
 import sys
 from pathlib import Path
-import os
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from lib.model.datasets import DNAPairDatasetWithMeta
+from lib.model.model import SiameseCNN
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -21,9 +23,6 @@ from scipy.stats import kendalltau
 from scipy.stats import pearsonr
 from scipy.stats import spearmanr
 from torch.utils.data import DataLoader
-
-from lib.model.datasets import DNAPairDatasetWithMeta
-from lib.model.model import SiameseCNN
 
 logging.basicConfig(
     level=logging.INFO,
@@ -318,7 +317,7 @@ def plot_embedding_vs_expression(
         "Evaluation plot saved to %s",
         output_path,
     )
-
+    
     
 def build_target_dataframe(
     df: pd.DataFrame,
