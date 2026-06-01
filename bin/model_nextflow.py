@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
-"""Nextflow wrapper for Siamese model training and evaluation.
+"""Train and evaluate Siamese promoter models in a Nextflow process.
 
-This script reuses the project model modules:
-- lib.model.datasets
-- lib.model.train_model
-- lib.model.evaluate_model
+This is intentionally close to bin/model_processing.py.
 
-It only changes what is required for Nextflow:
-- explicit train/validation/test inputs
-- process-local Model/ outputs
-- stable output folder declared by Nextflow
+Nextflow-related differences:
+- output directory is process-local: Model/
+- split files can be provided either as --data or as explicit --train/--validation/--test
+- evaluation output is written into Model/ so Nextflow can publish it
 """
 
 from __future__ import annotations
@@ -20,10 +17,10 @@ import logging
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import pandas as pd
 from torch.utils.data import DataLoader
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lib.model.datasets import DNAPairDatasetWithMeta
 from lib.model.evaluate_model import generate_embeddings
@@ -32,34 +29,58 @@ from lib.model.train_model import run_training
 
 logging.basicConfig(
     level=logging.INFO,
-    format="\033[1;32m%(levelname)s\033[0m | \033[1;36m%(name)s\033[0m | %(message)s",
+    format="\033[1;32m%(levelname)s\033[0m | "
+           "\033[1;36m%(name)s\033[0m | %(message)s",
 )
 
 logger = logging.getLogger(__name__)
 
+OUTPUT_DIR = Path(".")
+
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_NUM_EPOCHS = 15
-DEFAULT_LEARNING_RATE = 0.001
+DEFAULT_LEARNING_RATE = 1e-5
 DEFAULT_MARGIN = 1.0
-DEFAULT_DROPOUT = 0.3
-DEFAULT_WEIGHT_DECAY = 0.01
+DEFAULT_DROPOUT = 0
+DEFAULT_WEIGHT_DECAY = 0.001
+DEFAULT_KERNEL_SIZE_SMALL = 6
+DEFAULT_KERNEL_SIZE_MEDIUM = 10
+DEFAULT_KERNEL_SIZE_LARGE = 18
+DEFAULT_ATTENTION_HEADS = 4
+DEFAULT_EMBEDDING_DIM = 16
+DEFAULT_OPTUNA_TRIALS = 20
+DEFAULT_OPTUNA_JOBS = 1
+DEFAULT_OPTUNA_EPOCHS = 8
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+def parse_args(cli_args: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments.
 
-    parser.add_argument("--train", required=True, type=Path)
-    parser.add_argument("--validation", required=True, type=Path)
-    parser.add_argument("--test", required=True, type=Path)
+    This keeps the original model_processing.py interface and adds explicit
+    split-file arguments for Nextflow process inputs.
+    """
 
-    parser.add_argument("--dataset-name", "--name", dest="dataset_name", required=True)
-
-    parser.add_argument(
-        "--metric",
-        default="cosine_sim",
-        help="Expression similarity metric column.",
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
+    # Original interface
+    parser.add_argument(
+        "--data",
+        type=Path,
+        default=None,
+        help="Directory containing train.tsv, val.tsv and test.tsv.",
+    )
+    parser.add_argument("--name", "--dataset-name", dest="name", required=True)
+    parser.add_argument("--metric", default="cosine_sim")
+
+    # Nextflow explicit inputs
+    parser.add_argument("--train", type=Path, default=None)
+    parser.add_argument("--validation", type=Path, default=None)
+    parser.add_argument("--test", type=Path, default=None)
+
+    # Training hyperparameters
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--epochs", type=int, default=DEFAULT_NUM_EPOCHS)
     parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
@@ -67,151 +88,116 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=DEFAULT_DROPOUT)
     parser.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
 
-    parser.add_argument(
-        "--optimize",
-        action="store_true",
-        help="Run Optuna hyperparameter optimization.",
-    )
+    # Architecture hyperparameters
+    parser.add_argument("--small-kernel-size", type=int, default=DEFAULT_KERNEL_SIZE_SMALL)
+    parser.add_argument("--medium-kernel-size", type=int, default=DEFAULT_KERNEL_SIZE_MEDIUM)
+    parser.add_argument("--large-kernel-size", type=int, default=DEFAULT_KERNEL_SIZE_LARGE)
+    parser.add_argument("--attention-heads", type=int, default=DEFAULT_ATTENTION_HEADS)
+    parser.add_argument("--embedding-dim", type=int, default=DEFAULT_EMBEDDING_DIM)
 
-    return parser.parse_args()
+    # Optuna
+    parser.add_argument("--optimize", action="store_true")
+    parser.add_argument("--optuna-trials", type=int, default=DEFAULT_OPTUNA_TRIALS)
+    parser.add_argument("--optuna-jobs", type=int, default=DEFAULT_OPTUNA_JOBS)
+    parser.add_argument("--optuna-epochs", type=int, default=DEFAULT_OPTUNA_EPOCHS)
+
+    return parser.parse_args(cli_args)
 
 
-def read_split(path: Path, split_name: str) -> pd.DataFrame:
-    logger.info("Loading %s split from %s", split_name, path)
+def _load_split_table(path: Path, split_name: str) -> pd.DataFrame:
+    """Load one split table."""
 
-    dataframe = pd.read_csv(path, sep="\t")
+    if not path.exists():
+        raise FileNotFoundError(f"Missing required {split_name} split file: {path}")
+
+    dataframe = pd.read_csv(path, sep="	")
 
     if dataframe.empty:
         raise ValueError(f"{split_name} split is empty: {path}")
 
-    logger.info("%s rows: %d", split_name, len(dataframe))
+    logger.info("%s=%d rows", split_name, len(dataframe))
 
     return dataframe
 
 
+def _resolve_split_paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
+    """Resolve train, validation and test split paths."""
+
+    if args.data is not None:
+        return (
+            args.data / "train.tsv",
+            args.data / "val.tsv",
+            args.data / "test.tsv",
+        )
+
+    explicit_paths = [args.train, args.validation, args.test]
+
+    if any(path is None for path in explicit_paths):
+        raise ValueError(
+            "Provide either --data or all explicit split paths: "
+            "--train, --validation and --test."
+        )
+
+    return args.train, args.validation, args.test
+
+
 def build_evaluation_dataframe(
-    model,
+    prediction_dataframe: pd.DataFrame,
     test_dataframe: pd.DataFrame,
-    batch_size: int,
-    metric: str,
+    metric_column: str,
 ) -> pd.DataFrame:
-    loader = DataLoader(
-        DNAPairDatasetWithMeta(test_dataframe),
-        batch_size=batch_size,
-        shuffle=False,
-    )
+    """Align test predictions with expression similarity and labels."""
 
-    predictions = generate_embeddings(
-        model=model,
-        loader=loader,
-    )
+    required_columns = {"pair_row_id", metric_column}
+    missing_columns = required_columns - set(test_dataframe.columns)
 
-    target_columns = [
-        "pair_row_id",
-        metric,
-    ]
+    if missing_columns:
+        raise ValueError(f"Test dataframe is missing columns: {sorted(missing_columns)}")
+
+    target_columns = ["pair_row_id", metric_column]
 
     if "gene_id_human" in test_dataframe.columns and "gene_id_mouse" in test_dataframe.columns:
         target_columns.extend(["gene_id_human", "gene_id_mouse"])
-        merge_columns = ["pair_row_id", "gene_id_human", "gene_id_mouse"]
     elif "gene_id_1" in test_dataframe.columns and "gene_id_2" in test_dataframe.columns:
         target_columns.extend(["gene_id_1", "gene_id_2"])
-        predictions = predictions.rename(
-            columns={
-                "gene_id_human": "gene_id_1",
-                "gene_id_mouse": "gene_id_2",
-            }
-        )
-        merge_columns = ["pair_row_id", "gene_id_1", "gene_id_2"]
-    else:
-        raise ValueError(
-            "Test split must contain either gene_id_human/gene_id_mouse "
-            "or gene_id_1/gene_id_2."
-        )
 
     if "original_label" in test_dataframe.columns:
         target_columns.append("original_label")
     elif "label" in test_dataframe.columns:
         target_columns.append("label")
 
-    missing_columns = sorted(set(target_columns) - set(test_dataframe.columns))
-    if missing_columns:
-        raise ValueError(
-            f"Missing required columns in test split for evaluation: {missing_columns}"
-        )
-
     target_dataframe = test_dataframe[target_columns].copy()
 
-    evaluation_dataframe = predictions.merge(
+    evaluation_dataframe = prediction_dataframe.merge(
         target_dataframe,
         on="pair_row_id",
         how="inner",
     )
 
-    if len(evaluation_dataframe) != len(predictions):
-        logger.warning(
-            "Evaluation merge kept %d/%d prediction rows.",
-            len(evaluation_dataframe),
-            len(predictions),
-        )
+    if len(evaluation_dataframe) != len(prediction_dataframe):
+        raise ValueError("Prediction-to-target merge changed the number of rows.")
 
     return evaluation_dataframe
 
 
-def main() -> Path:
-    args = parse_args()
-
-    train_dataframe = read_split(args.train, "train")
-    validation_dataframe = read_split(args.validation, "validation")
-    test_dataframe = read_split(args.test, "test")
-
-    model_output_dir = Path("Model")
-    model_output_dir.mkdir(parents=True, exist_ok=True)
-
-    logger.info("Starting model training.")
-
-    model = run_training(
-        df_train=train_dataframe,
-        df_val=validation_dataframe,
-        df_test=test_dataframe,
-        model_output_dir=model_output_dir,
-        batch_size=args.batch_size,
-        margin=args.margin,
-        num_epochs=args.epochs,
-        learning_rate=args.learning_rate,
-        dropout_rate=args.dropout,
-        weight_decay=args.weight_decay,
-        optimize_hparams=args.optimize,
-        metric_column=args.metric,
-    )
-
-    logger.info("Training completed. Starting evaluation.")
-
-    evaluation_dataframe = build_evaluation_dataframe(
-        model=model,
-        test_dataframe=test_dataframe,
-        batch_size=args.batch_size,
-        metric=args.metric,
-    )
-
-    evaluation_path = model_output_dir / "evaluation_predictions.tsv"
-    evaluation_dataframe.to_csv(
-        evaluation_path,
-        sep="\t",
-        index=False,
-    )
-
-    plot_embedding_vs_expression(
-        df=evaluation_dataframe,
-        metric=args.metric,
-        output_path=model_output_dir / "evaluation_plot.png",
-    )
+def write_manifest(
+    output_path: Path,
+    args: argparse.Namespace,
+    train_path: Path,
+    validation_path: Path,
+    test_path: Path,
+    df_train: pd.DataFrame,
+    df_val: pd.DataFrame,
+    df_test: pd.DataFrame,
+) -> None:
+    """Write a run manifest for reproducibility."""
 
     manifest = {
-        "dataset_name": args.dataset_name,
-        "train": str(args.train),
-        "validation": str(args.validation),
-        "test": str(args.test),
+        "name": args.name,
+        "data": str(args.data) if args.data is not None else None,
+        "train": str(train_path),
+        "validation": str(validation_path),
+        "test": str(test_path),
         "metric": args.metric,
         "batch_size": args.batch_size,
         "epochs": args.epochs,
@@ -219,20 +205,116 @@ def main() -> Path:
         "margin": args.margin,
         "dropout": args.dropout,
         "weight_decay": args.weight_decay,
+        "small_kernel_size": args.small_kernel_size,
+        "medium_kernel_size": args.medium_kernel_size,
+        "large_kernel_size": args.large_kernel_size,
+        "attention_heads": args.attention_heads,
+        "embedding_dim": args.embedding_dim,
         "optimize": args.optimize,
-        "train_rows": len(train_dataframe),
-        "validation_rows": len(validation_dataframe),
-        "test_rows": len(test_dataframe),
-        "output_policy": "all model outputs are written process-locally under Model/",
+        "optuna_trials": args.optuna_trials,
+        "optuna_jobs": args.optuna_jobs,
+        "optuna_epochs": args.optuna_epochs,
+        "train_rows": len(df_train),
+        "validation_rows": len(df_val),
+        "test_rows": len(df_test),
+        "output_policy": "Nextflow process-local output directory: Model/",
     }
 
-    manifest_path = model_output_dir / "model_manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    output_path.write_text(json.dumps(manifest, indent=2) + "")
+
+
+def main(cli_args: list[str] | None = None) -> Path:
+    """Run training and evaluation workflow."""
+
+    args = parse_args(cli_args)
+
+    logger.info("Loading datasets.")
+
+    train_path, validation_path, test_path = _resolve_split_paths(args)
+
+    df_train = _load_split_table(train_path, "Train")
+    df_val = _load_split_table(validation_path, "Validation")
+    df_test = _load_split_table(test_path, "Test")
+
+    logger.info(
+        "Train=%d | Validation=%d | Test=%d",
+        len(df_train),
+        len(df_val),
+        len(df_test),
+    )
+
+    model_dir = OUTPUT_DIR / "Model"
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Starting model training.")
+
+    model = run_training(
+        df_train=df_train,
+        df_val=df_val,
+        df_test=df_test,
+        model_output_dir=model_dir,
+        batch_size=args.batch_size,
+        margin=args.margin,
+        num_epochs=args.epochs,
+        learning_rate=args.learning_rate,
+        dropout_rate=args.dropout,
+        weight_decay=args.weight_decay,
+        small_kernel_size=args.small_kernel_size,
+        medium_kernel_size=args.medium_kernel_size,
+        large_kernel_size=args.large_kernel_size,
+        attention_heads=args.attention_heads,
+        embedding_dim=args.embedding_dim,
+        optimize_hparams=args.optimize,
+        optuna_trials=args.optuna_trials,
+        optuna_jobs=args.optuna_jobs,
+        optuna_epochs=args.optuna_epochs,
+        metric_column=args.metric,
+    )
+
+    logger.info("Training completed.")
+    logger.info("Running evaluation.")
+
+    loader = DataLoader(
+        DNAPairDatasetWithMeta(df_test),
+        batch_size=args.batch_size,
+        shuffle=False,
+    )
+
+    prediction_dataframe = generate_embeddings(
+        model=model,
+        loader=loader,
+    )
+
+    evaluation_dataframe = build_evaluation_dataframe(
+        prediction_dataframe=prediction_dataframe,
+        test_dataframe=df_test,
+        metric_column=args.metric,
+    )
+
+    plot_embedding_vs_expression(
+        df=evaluation_dataframe,
+        metric=args.metric,
+        output_path=model_dir / "evaluation_plot.png",
+    )
+
+    evaluation_path = model_dir / "evaluation_predictions.tsv"
+    evaluation_dataframe.to_csv(evaluation_path, sep="	", index=False)
+
+    write_manifest(
+        output_path=model_dir / "model_manifest.json",
+        args=args,
+        train_path=train_path,
+        validation_path=validation_path,
+        test_path=test_path,
+        df_train=df_train,
+        df_val=df_val,
+        df_test=df_test,
+    )
 
     logger.info("Evaluation predictions saved to %s", evaluation_path)
-    logger.info("Model outputs generated in %s", model_output_dir)
+    logger.info("Workflow completed successfully.")
 
-    return model_output_dir
+    return evaluation_path
 
 
 if __name__ == "__main__":
