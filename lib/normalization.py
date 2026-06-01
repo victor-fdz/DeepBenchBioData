@@ -59,28 +59,28 @@ def clr_norm(df: pd.DataFrame, numeric_cols: list[str]) -> pd.DataFrame:
     return df_out
 
 
-def ranking_norm(df: pd.DataFrame, numeric_cols: list[str]) -> pd.DataFrame:
-    """
-    Replace values with descending rank per column.
+# def ranking_norm(df: pd.DataFrame, numeric_cols: list[str]) -> pd.DataFrame:
+#     """
+#     Replace values with descending rank per column.
 
-    Args:
-        - df (pd.DataFrame): Input dataframe
-        - numeric_cols (list[str]): Columns to rank
+#     Args:
+#         - df (pd.DataFrame): Input dataframe
+#         - numeric_cols (list[str]): Columns to rank
 
-    Returns:
-        pd.DataFrame: Rank-normalized dataframe
-    """
+#     Returns:
+#         pd.DataFrame: Rank-normalized dataframe
+#     """
 
-    df_out = df.copy()
+#     df_out = df.copy()
 
-    # rank per column independently
-    df_out[numeric_cols] = df_out[numeric_cols].rank(
-        method="min",
-        axis=0,
-        ascending=False,
-    )
+#     # rank per column independently
+#     df_out[numeric_cols] = df_out[numeric_cols].rank(
+#         method="min",
+#         axis=0,
+#         ascending=False,
+#     )
 
-    return df_out
+#     return df_out
 
 
 def quantile_norm(df: pd.DataFrame, numeric_cols: list[str]) -> pd.DataFrame:
@@ -305,7 +305,7 @@ def no_norm(df: pd.DataFrame, numeric_cols: list[str]) -> pd.DataFrame:
 NORMALIZATION_METHODS = [
     log1p_norm,
     clr_norm,
-    ranking_norm,
+    # ranking_norm,
     quantile_norm,
     quantile_sample_norm,
     deseq2_norm,

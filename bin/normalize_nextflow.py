@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
-"""Nextflow-native normalization benchmark driver.
+"""Nextflow wrapper for the normalization benchmark.
 
-This script writes only process-local, stable relative outputs.
-Nextflow owns publication into the final results directory.
+This script intentionally reuses the project normalization modules:
+- lib.modify_dataset
+- lib.normalization
+- lib.compute_stats
+- lib.plotting
+
+It only changes what is required for Nextflow:
+- no interactive method selection
+- outputs are staged into stable process-local folders declared by Nextflow
 """
 
 from __future__ import annotations
@@ -13,32 +20,57 @@ import logging
 import shutil
 import sys
 from pathlib import Path
-from typing import Callable
 
-import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
-import seaborn as sns
 
+# Add project root to Python path for direct execution
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lib import compute_stats as compst
+from lib import modify_dataset as mod
 from lib import normalization as normfx
+from lib import plotting as pt
 
+# -----------------------------
+# Setup
+# -----------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(levelname)s | %(name)s | %(message)s",
+    format="\033[1;32m%(levelname)s\033[0m | \033[1;36m%(name)s\033[0m | %(message)s",
 )
 
 logger = logging.getLogger(__name__)
 
+OUTPUT_DIR = Path(".")
 
+
+# -----------------------------
+# CLI
+# -----------------------------
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
 
-    parser.add_argument("--input", required=True, type=Path)
-    parser.add_argument("--dataset-name", required=True)
-    parser.add_argument("--tissue", default="General")
+    parser.add_argument(
+        "--input",
+        required=True,
+        type=Path,
+        help="Path to input TSV with TPM values.",
+    )
+
+    parser.add_argument(
+        "--dataset-name",
+        "--name",
+        dest="dataset_name",
+        required=True,
+        help="Dataset name used for metadata and temporary process-local naming.",
+    )
+
+    parser.add_argument(
+        "--tissue",
+        default="General",
+        help="Tissue used for automatic method ranking.",
+    )
+
     parser.add_argument(
         "--selection-metric",
         default="pearson_increment",
@@ -48,188 +80,22 @@ def parse_args() -> argparse.Namespace:
             "pearson_ortho",
             "spearman_ortho",
         ],
-    )
-    parser.add_argument(
-        "--methods",
-        default="",
-        help="Optional comma-separated normalization methods. If omitted, all registered methods are used.",
+        help="Metric used for automatic normalization method selection.",
     )
 
     return parser.parse_args()
 
 
-def get_feature_columns(dataframe: pd.DataFrame) -> list[str]:
-    return [
-        column
-        for column in dataframe.columns
-        if len(column.split("_")) >= 3 and column.split("_")[-2] == "tpm"
-    ]
-
-
-def get_tissues(feature_columns: list[str]) -> list[str]:
-    return sorted({column.rsplit("_", 2)[0] for column in feature_columns})
-
-
-def resolve_methods(methods_argument: str) -> list[Callable]:
-    available_methods = {
-        method.__name__: method
-        for method in normfx.NORMALIZATION_METHODS
-    }
-
-    if not methods_argument:
-        return normfx.NORMALIZATION_METHODS
-
-    requested_methods = [
-        method_name.strip()
-        for method_name in methods_argument.split(",")
-        if method_name.strip()
-    ]
-
-    unknown_methods = sorted(set(requested_methods) - set(available_methods))
-    if unknown_methods:
-        raise ValueError(
-            "Unknown normalization method(s): "
-            + ", ".join(unknown_methods)
-            + ". Available methods: "
-            + ", ".join(sorted(available_methods))
-        )
-
-    return [available_methods[method_name] for method_name in requested_methods]
-
-
-def generate_all_nonortholog_dataframe(dataframe: pd.DataFrame) -> pd.DataFrame:
-    human_columns = [column for column in dataframe.columns if "human" in column] + ["gene_name"]
-    mouse_columns = [column for column in dataframe.columns if "mouse" in column] + ["gene_name"]
-
-    human = dataframe[human_columns].rename(columns={"gene_name": "gene_name_human"})
-    mouse = dataframe[mouse_columns].rename(columns={"gene_name": "gene_name_mouse"})
-
-    all_pairs_dataframe = human.merge(mouse, how="cross")
-
-    original_ortholog_pairs = set(
-        zip(
-            dataframe["gene_id_human"].astype(str),
-            dataframe["gene_id_mouse"].astype(str),
-        )
-    )
-
-    candidate_pairs = list(
-        zip(
-            all_pairs_dataframe["gene_id_human"].astype(str),
-            all_pairs_dataframe["gene_id_mouse"].astype(str),
-        )
-    )
-
-    nonortholog_mask = ~pd.Series(
-        candidate_pairs,
-        index=all_pairs_dataframe.index,
-    ).isin(original_ortholog_pairs)
-
-    if {"gene_name_human", "gene_name_mouse"}.issubset(all_pairs_dataframe.columns):
-        nonortholog_mask = (
-            nonortholog_mask
-            & (all_pairs_dataframe["gene_name_human"] != all_pairs_dataframe["gene_name_mouse"])
-        )
-
-    nonortholog_dataframe = all_pairs_dataframe[nonortholog_mask].reset_index(drop=True)
-
-    meta_human = ["gene_id_human", "gene_name_human"]
-    meta_mouse = ["gene_id_mouse", "gene_name_mouse"]
-
-    tpm_human = [
-        column
-        for column in human.columns
-        if column not in meta_human
-    ]
-
-    tpm_mouse = [
-        column
-        for column in mouse.columns
-        if column not in meta_mouse
-    ]
-
-    column_order = (
-        meta_human[:1]
-        + meta_mouse[:1]
-        + meta_human[1:]
-        + meta_mouse[1:]
-        + tpm_human
-        + tpm_mouse
-    )
-
-    return nonortholog_dataframe[column_order]
-
-
-def prepare_output_directories() -> None:
-    for directory_name in [
-        "Intermediate_Datasets",
-        "Orthologs",
-        "NonOrthologs",
-        "Normalization",
-    ]:
-        directory_path = Path(directory_name)
-        if directory_path.exists():
-            shutil.rmtree(directory_path)
-        directory_path.mkdir(parents=True, exist_ok=True)
-
-
-def apply_and_save_normalizations(
-    dataframe: pd.DataFrame,
-    feature_columns: list[str],
-    methods: list[Callable],
-    output_directory: Path,
-) -> tuple[list[pd.DataFrame], list[str]]:
-    output_directory.mkdir(parents=True, exist_ok=True)
-
-    dataframes = [dataframe.copy()]
-    method_names = ["original"]
-
-    dataframe.to_csv(output_directory / "original.tsv", sep="\t", index=False)
-
-    for method in methods:
-        method_name = method.__name__
-        normalized_dataframe = method(dataframe.copy(), numeric_cols=feature_columns)
-
-        normalized_dataframe.to_csv(
-            output_directory / f"{method_name}.tsv",
-            sep="\t",
-            index=False,
-        )
-
-        dataframes.append(normalized_dataframe)
-        method_names.append(method_name)
-
-    return dataframes, method_names
-
-
-def merge_and_increment(
-    stats_orthologs: pd.DataFrame,
-    stats_nonorthologs: pd.DataFrame,
-) -> pd.DataFrame:
-    stats_all = pd.merge(
-        stats_orthologs,
-        stats_nonorthologs,
-        on=["tissue", "method"],
-        suffixes=("_ortho", "_nonortho"),
-    )
-
-    stats_all["Pearson_R_increment"] = (
-        stats_all["Pearson_R_ortho"]
-        - stats_all["Pearson_R_nonortho"].clip(lower=0)
-    )
-    stats_all["Spearman_rho_increment"] = (
-        stats_all["Spearman_rho_ortho"]
-        - stats_all["Spearman_rho_nonortho"].clip(lower=0)
-    )
-
-    return stats_all
-
-
+# -----------------------------
+# Helpers
+# -----------------------------
 def select_best_method(
     stats_dataframe: pd.DataFrame,
     tissue: str,
     selection_metric: str,
 ) -> tuple[str, pd.DataFrame]:
+    """Select the best normalization method without interactive input."""
+
     tissue_stats = stats_dataframe[stats_dataframe["tissue"] == tissue].copy()
 
     if tissue_stats.empty:
@@ -259,244 +125,230 @@ def select_best_method(
     ranking["selection_metric"] = selection_metric
     ranking["selection_score_column"] = score_column
 
-    best_method = str(ranking.loc[0, "method"])
-
-    return best_method, ranking
+    return str(ranking.loc[0, "method"]), ranking
 
 
-def get_xy_values(
-    dataframe: pd.DataFrame,
-    tissues: list[str],
-    tissue: str,
-) -> tuple[np.ndarray, np.ndarray]:
-    if tissue == "General":
-        human_values = dataframe[[f"{tissue_name}_tpm_human" for tissue_name in tissues]].to_numpy().ravel()
-        mouse_values = dataframe[[f"{tissue_name}_tpm_mouse" for tissue_name in tissues]].to_numpy().ravel()
-    else:
-        human_values = dataframe[f"{tissue}_tpm_human"].to_numpy()
-        mouse_values = dataframe[f"{tissue}_tpm_mouse"].to_numpy()
+def copy_directory_contents(source_dir: Path, target_dir: Path) -> None:
+    """Replace target_dir with a copy of source_dir."""
 
-    return mouse_values, human_values
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+
+    shutil.copytree(source_dir, target_dir)
 
 
-def plot_scatter_grid(
-    normalized_dataframes: list[pd.DataFrame],
-    method_names: list[str],
-    stats_dataframe: pd.DataFrame,
-    tissues: list[str],
-    output_path: Path,
-    title_prefix: str,
-) -> None:
-    row_labels = tissues + ["General"]
-    number_of_rows = len(row_labels)
-    number_of_columns = len(method_names)
+def create_nextflow_output_aliases(normalization_dir: Path) -> None:
+    """Create stable lowercase plot names expected by the Nextflow module.
 
-    _, axes = plt.subplots(
-        number_of_rows,
-        number_of_columns,
-        figsize=(number_of_columns * 3, number_of_rows * 3),
-        squeeze=False,
-    )
+    lib.plotting.py controls the real figure generation. This function only
+    creates predictable aliases for Nextflow output declarations.
+    """
 
-    for column_index, (method_name, dataframe) in enumerate(zip(method_names, normalized_dataframes)):
-        for row_index, tissue in enumerate(row_labels):
-            axis = axes[row_index, column_index]
-            mouse_values, human_values = get_xy_values(dataframe, tissues, tissue)
+    alias_pairs = {
+        "Orthologs_scatter.png": "orthologs_scatter.png",
+        "NonOrthologs_scatter.png": "nonorthologs_scatter.png",
+        "Increment_PearsonR_heatmap.png": "increment_pearson_heatmap.png",
+    }
 
-            sns.scatterplot(
-                x=mouse_values,
-                y=human_values,
-                ax=axis,
-                alpha=0.5,
-                legend=False,
-            )
+    for source_name, alias_name in alias_pairs.items():
+        source_path = normalization_dir / source_name
+        alias_path = normalization_dir / alias_name
 
-            stat_row = stats_dataframe[
-                (stats_dataframe["tissue"] == tissue)
-                & (stats_dataframe["method"] == method_name)
-            ]
-
-            if not stat_row.empty:
-                pearson_value = float(stat_row["Pearson_R"].iloc[0])
-                spearman_value = float(stat_row["Spearman_rho"].iloc[0])
-                stat_text = f"Rp={pearson_value:.3f} / Rs={spearman_value:.3f}"
-            else:
-                stat_text = "stats unavailable"
-
-            axis.set_title(
-                f"{method_name}\n{stat_text}" if row_index == 0 else stat_text,
-                fontsize=9,
-            )
-            axis.set_ylabel(f"{tissue}\nHuman" if column_index == 0 else "", fontsize=8)
-            axis.set_xlabel("Mouse" if row_index == number_of_rows - 1 else "", fontsize=8)
-
-    plt.suptitle(title_prefix, y=1.002)
-    plt.tight_layout()
-    plt.savefig(output_path, format="svg")
-    plt.close()
+        if source_path.exists():
+            shutil.copy2(source_path, alias_path)
 
 
-def plot_increment_heatmap(
-    stats_dataframe: pd.DataFrame,
-    ranking: pd.DataFrame,
-    output_path: Path,
-) -> None:
-    sorted_methods = ranking["method"].tolist()
+def stage_outputs_for_nextflow(dataset_name: str) -> None:
+    """Expose stable process-local outputs at paths declared in the Nextflow module."""
 
-    heatmap_dataframe = stats_dataframe.pivot(
-        index="tissue",
-        columns="method",
-        values="Pearson_R_increment",
-    )
-    heatmap_dataframe = heatmap_dataframe.reindex(columns=sorted_methods)
+    dataset_dir = OUTPUT_DIR / dataset_name
 
-    row_order = [tissue for tissue in heatmap_dataframe.index if tissue != "General"] + ["General"]
-    heatmap_dataframe = heatmap_dataframe.reindex(row_order)
-
-    plt.figure(figsize=(12, 7))
-    sns.heatmap(
-        heatmap_dataframe,
-        annot=True,
-        cmap="BuGn",
-        fmt=".3f",
-        linewidths=0.5,
-        vmin=0,
-        vmax=1,
-        cbar_kws={"label": "R orthologs - max(0, R all non-orthologs)"},
-    )
-    plt.ylabel("Tissue")
-    plt.xlabel("Normalization method")
-    plt.tight_layout()
-    plt.savefig(output_path, format="svg")
-    plt.close()
+    copy_directory_contents(dataset_dir / "Orthologs", Path("Orthologs"))
+    copy_directory_contents(dataset_dir / "NonOrthologs", Path("NonOrthologs"))
+    copy_directory_contents(dataset_dir / "Intermediate_Datasets", Path("Intermediate_Datasets"))
+    copy_directory_contents(dataset_dir / "Normalization", Path("Normalization"))
 
 
-def main() -> Path:
+# -----------------------------
+# Main pipeline
+# -----------------------------
+def main() -> str:
     args = parse_args()
 
-    prepare_output_directories()
-
     logger.info("Loading raw expression dataset: %s", args.input)
-    raw_dataframe = pd.read_csv(args.input, sep="\t")
+    df = pd.read_csv(args.input, sep="\t")
 
-    feature_columns = get_feature_columns(raw_dataframe)
-    if not feature_columns:
-        raise ValueError("No TPM columns detected. Expected columns like <tissue>_tpm_<species>.")
+    # extract TPM feature columns
+    features = [column for column in df.columns if column.split("_")[-2] == "tpm"]
 
-    tissues = get_tissues(feature_columns)
-    logger.info("Detected %d TPM columns across %d tissues.", len(feature_columns), len(tissues))
+    # extract tissues from feature names
+    tissues = list({column.rsplit("_", 2)[0] for column in features})
 
-    methods = resolve_methods(args.methods)
-    method_names_selected = [method.__name__ for method in methods]
-
-    logger.info("Generating all non-orthologous human x mouse pairs.")
-    nonortholog_dataframe = generate_all_nonortholog_dataframe(raw_dataframe)
-    nonortholog_dataframe.to_csv(
-        Path("Intermediate_Datasets") / "all_nonorthologs.tsv",
-        sep="\t",
-        index=False,
+    logger.info(
+        "Detected %d TPM columns across %d tissues.",
+        len(features),
+        len(tissues),
     )
 
+    # -----------------------------
+    # Generate all non-ortholog pairs
+    # -----------------------------
+    logger.info("Generating all non-orthologous human x mouse pairs.")
+    nonortho_df = mod.all_nonortholog_pairs(
+        df,
+        args.dataset_name,
+        OUTPUT_DIR,
+    )
+
+    # -----------------------------
+    # Apply normalization
+    # -----------------------------
     logger.info("Applying normalization methods to orthologous dataset.")
-    ortholog_dataframes, ortholog_method_names = apply_and_save_normalizations(
-        dataframe=raw_dataframe,
-        feature_columns=feature_columns,
-        methods=methods,
-        output_directory=Path("Orthologs"),
+    normfx.apply_normalizations(
+        df=df,
+        df_name=args.dataset_name,
+        features=features,
+        orthology="Orthologs",
+        output_dir=OUTPUT_DIR,
     )
 
     logger.info("Applying normalization methods to all non-orthologous pairs.")
-    nonortholog_dataframes, nonortholog_method_names = apply_and_save_normalizations(
-        dataframe=nonortholog_dataframe,
-        feature_columns=feature_columns,
-        methods=methods,
-        output_directory=Path("NonOrthologs"),
+    normfx.apply_normalizations(
+        df=nonortho_df,
+        df_name=args.dataset_name,
+        features=features,
+        orthology="NonOrthologs",
+        output_dir=OUTPUT_DIR,
     )
 
+    # -----------------------------
+    # Load normalized datasets
+    # -----------------------------
+    dfs_ortho, names_ortho = normfx.load_normalized_data(
+        args.dataset_name,
+        "Orthologs",
+        OUTPUT_DIR,
+    )
+
+    dfs_nonortho, names_nonortho = normfx.load_normalized_data(
+        args.dataset_name,
+        "NonOrthologs",
+        OUTPUT_DIR,
+    )
+
+    # -----------------------------
+    # Compute statistics
+    # -----------------------------
     logger.info("Computing normalization correlation statistics.")
-    stats_orthologs = compst.compute_stats(
-        ortholog_dataframes,
-        ortholog_method_names,
-        feature_columns,
+
+    stats_ortho = compst.compute_stats(
+        dfs_ortho,
+        names_ortho,
+        features,
         tissues,
         "Orthologs",
     )
 
-    stats_nonorthologs = compst.compute_stats(
-        nonortholog_dataframes,
-        nonortholog_method_names,
-        feature_columns,
+    stats_nonortho = compst.compute_stats(
+        dfs_nonortho,
+        names_nonortho,
+        features,
         tissues,
         "NonOrthologs",
     )
 
-    stats_all = merge_and_increment(
-        stats_orthologs=stats_orthologs,
-        stats_nonorthologs=stats_nonorthologs,
+    stats_all = compst.merge_and_increment(
+        args.dataset_name,
+        stats_ortho,
+        stats_nonortho,
+        OUTPUT_DIR,
     )
 
-    stats_path = Path("Normalization") / "stats.tsv"
-    stats_all.to_csv(stats_path, sep="\t", index=False)
+    # -----------------------------
+    # Plot results using lib.plotting
+    # -----------------------------
+    logger.info("Generating normalization plots using lib.plotting.")
 
+    ortho_dict = dict(zip(names_ortho, dfs_ortho))
+    nonortho_dict = dict(zip(names_nonortho, dfs_nonortho))
+
+    pt.plot_correlations(
+        ortho_dict,
+        stats_all,
+        tissues,
+        args.dataset_name,
+        "Orthologs",
+        OUTPUT_DIR,
+    )
+
+    pt.plot_correlations(
+        nonortho_dict,
+        stats_all,
+        tissues,
+        args.dataset_name,
+        "NonOrthologs",
+        OUTPUT_DIR,
+    )
+
+    sorted_methods = pt.sort_methods_by_correlation(
+        stats_all,
+        orthology="Increment",
+        tissue=args.tissue,
+    )
+
+    pt.plot_heatmap(
+        stats_all,
+        args.dataset_name,
+        sorted_methods,
+        "Pearson_R",
+        "Increment",
+        OUTPUT_DIR,
+    )
+
+    # -----------------------------
+    # Automatic method selection for Nextflow
+    # -----------------------------
     best_method, ranking = select_best_method(
         stats_dataframe=stats_all,
         tissue=args.tissue,
         selection_metric=args.selection_metric,
     )
 
-    logger.info("Best normalization method: %s", best_method)
+    normalization_dir = OUTPUT_DIR / args.dataset_name / "Normalization"
 
-    ranking_path = Path("Normalization") / "normalization_method_ranking.tsv"
+    ranking_path = normalization_dir / "normalization_method_ranking.tsv"
     ranking.to_csv(ranking_path, sep="\t", index=False)
 
-    best_method_path = Path("Normalization") / "best_method.txt"
+    best_method_path = normalization_dir / "best_method.txt"
     best_method_path.write_text(best_method + "\n")
 
     manifest = {
         "input": str(args.input),
         "dataset_name": args.dataset_name,
         "tissues": tissues,
-        "feature_columns": feature_columns,
-        "normalization_methods": method_names_selected,
+        "feature_columns": features,
+        "normalization_methods": names_ortho,
         "nonortholog_strategy": "all human x mouse pairs minus true ortholog pairs",
-        "increment_formula": "R_orthologs - max(0, R_all_nonorthologs)",
         "selection_tissue": args.tissue,
         "selection_metric": args.selection_metric,
         "best_method": best_method,
-        "output_policy": "process-local outputs only; Nextflow publishes declared outputs",
+        "plotting_module": "lib.plotting",
+        "nextflow_output_policy": "stable process-local output folders are declared by the Nextflow process",
     }
 
-    manifest_path = Path("Normalization") / "normalization_manifest.json"
+    manifest_path = normalization_dir / "normalization_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 
-    logger.info("Generating normalization plots.")
-    plot_scatter_grid(
-        normalized_dataframes=ortholog_dataframes,
-        method_names=ortholog_method_names,
-        stats_dataframe=stats_orthologs,
-        tissues=tissues,
-        output_path=Path("Normalization") / "orthologs_scatter.svg",
-        title_prefix="Orthologs",
-    )
+    logger.info("Best normalization method: %s", best_method)
 
-    plot_scatter_grid(
-        normalized_dataframes=nonortholog_dataframes,
-        method_names=nonortholog_method_names,
-        stats_dataframe=stats_nonorthologs,
-        tissues=tissues,
-        output_path=Path("Normalization") / "nonorthologs_scatter.svg",
-        title_prefix="All non-orthologs",
-    )
-
-    plot_increment_heatmap(
-        stats_dataframe=stats_all,
-        ranking=ranking,
-        output_path=Path("Normalization") / "increment_pearson_heatmap.svg",
-    )
+    # -----------------------------
+    # Stable output staging for Nextflow
+    # -----------------------------
+    stage_outputs_for_nextflow(args.dataset_name)
 
     logger.info("Normalization outputs generated in process working directory.")
 
-    return best_method_path
+    return best_method
 
 
 if __name__ == "__main__":

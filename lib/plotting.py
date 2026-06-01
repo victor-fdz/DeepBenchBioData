@@ -24,6 +24,8 @@ ORTHOLOGY_TAG = {
 SCATTER_COLOR = {
     "orthologs": "blue",
     "nonorthologs": "orange",
+    "ortho": "blue",
+    "nonortho": "orange",
 }
 
 # Plot size presets
@@ -232,10 +234,10 @@ def plot_correlations(
     plt.tight_layout()
 
     # save figure
-    out_path = output_dir / df_name / "Normalization" / f"{df_name}_{orthology}_scatter.svg"
+    out_path = output_dir / df_name / "Normalization" / f"{orthology}_scatter.png"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    plt.savefig(out_path, format="svg")
+    plt.savefig(out_path, format="png")
     plt.close()
 
     logger.info("Scatter plot saved to %s", out_path)
@@ -335,10 +337,10 @@ def plot_heatmap(
     plt.tight_layout()
 
     # save output
-    out_path = output_dir / df_name / "Normalization" / f"{df_name}_{orthology}_{criteria.replace('_', '')}_heatmap.svg"
+    out_path = output_dir / df_name / "Normalization" / f"{orthology}_{criteria.replace('_', '')}_heatmap.png"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    plt.savefig(out_path, format="svg")
+    plt.savefig(out_path, format="png")
     plt.close()
 
     logger.info("Heatmap saved to %s", out_path) 
