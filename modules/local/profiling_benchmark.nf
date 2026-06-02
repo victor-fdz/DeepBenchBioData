@@ -23,6 +23,7 @@ process PROFILING_BENCHMARK {
     python ${projectDir}/bin/profiling_nextflow.py \
         --input ${raw_expression_dataset} \
         --dataset-name ${dataset_name} \
+        --expression-unit ${params.expression_unit} \
         ${promoter_argument}
     """
 }

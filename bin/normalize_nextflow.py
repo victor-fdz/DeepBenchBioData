@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
         "--input",
         required=True,
         type=Path,
-        help="Path to input TSV with TPM values.",
+        help="Path to input TSV with expression values.",
     )
 
     parser.add_argument(
@@ -83,6 +83,12 @@ def parse_args() -> argparse.Namespace:
         help="Metric used for automatic normalization method selection.",
     )
 
+    parser.add_argument(
+        "--expression-unit",
+        default="tpm",
+        choices=["tpm", "counts"],
+    )
+
     return parser.parse_args()
 
 
@@ -93,6 +99,7 @@ def select_best_method(
     stats_dataframe: pd.DataFrame,
     tissue: str,
     selection_metric: str,
+    expression_unit: str = "tpm",
 ) -> tuple[str, pd.DataFrame]:
     """Select the best normalization method without interactive input."""
 
@@ -125,8 +132,21 @@ def select_best_method(
     ranking["selection_metric"] = selection_metric
     ranking["selection_score_column"] = score_column
 
-    return str(ranking.loc[0, "method"]), ranking
+    selected_method = str(ranking.loc[0, "method"])
 
+    if expression_unit == "counts" and selected_method == "original":
+        if len(ranking) < 2:
+            raise ValueError(
+                "Best method is 'original' for raw counts, but no second method is available."
+            )
+
+        logger.warning(
+            "Best method was 'original' with raw counts. Selecting second-best method instead."
+        )
+
+        selected_method = str(ranking.loc[1, "method"])
+
+    return selected_method, ranking
 
 def copy_directory_contents(source_dir: Path, target_dir: Path) -> None:
     """Replace target_dir with a copy of source_dir."""
@@ -169,6 +189,29 @@ def stage_outputs_for_nextflow(dataset_name: str) -> None:
     copy_directory_contents(dataset_dir / "Normalization", Path("Normalization"))
 
 
+def get_feature_columns(df, expression_unit):
+    return [c for c in df.columns if f"_{expression_unit}_" in c]
+
+
+def get_tissues(feature_columns, expression_unit):
+    return sorted({
+        c.rsplit(f"_{expression_unit}_", 1)[0]
+        for c in feature_columns
+    })
+
+
+def expr_col(tissue, species, expression_unit):
+    return f"{tissue}_{expression_unit}_{species}"
+
+
+def get_gene_name_column(df):
+    if "name_gene" in df.columns:
+        return "name_gene"
+    if "gene_name" in df.columns:
+        return "gene_name"
+    raise ValueError("Missing gene name column: expected 'name_gene' or 'gene_name'.")
+
+
 # -----------------------------
 # Main pipeline
 # -----------------------------
@@ -178,14 +221,14 @@ def main() -> str:
     logger.info("Loading raw expression dataset: %s", args.input)
     df = pd.read_csv(args.input, sep="\t")
 
-    # extract TPM feature columns
-    features = [column for column in df.columns if column.split("_")[-2] == "tpm"]
+    # extract expression feature columns
+    features = get_feature_columns(df, args.expression_unit)
 
     # extract tissues from feature names
-    tissues = list({column.rsplit("_", 2)[0] for column in features})
+    tissues = get_tissues(features, args.expression_unit)
 
     logger.info(
-        "Detected %d TPM columns across %d tissues.",
+        "Detected %d expression columns across %d tissues.",
         len(features),
         len(tissues),
     )
@@ -198,6 +241,7 @@ def main() -> str:
         df,
         args.dataset_name,
         OUTPUT_DIR,
+        expression_unit=args.expression_unit,
     )
 
     # -----------------------------
@@ -247,6 +291,7 @@ def main() -> str:
         features,
         tissues,
         "Orthologs",
+        expression_unit=args.expression_unit,
     )
 
     stats_nonortho = compst.compute_stats(
@@ -255,6 +300,7 @@ def main() -> str:
         features,
         tissues,
         "NonOrthologs",
+        expression_unit=args.expression_unit,
     )
 
     stats_all = compst.merge_and_increment(
@@ -279,6 +325,7 @@ def main() -> str:
         args.dataset_name,
         "Orthologs",
         OUTPUT_DIR,
+        expression_unit=args.expression_unit,
     )
 
     pt.plot_correlations(
@@ -288,6 +335,7 @@ def main() -> str:
         args.dataset_name,
         "NonOrthologs",
         OUTPUT_DIR,
+        expression_unit=args.expression_unit,
     )
 
     sorted_methods = pt.sort_methods_by_correlation(
@@ -312,6 +360,7 @@ def main() -> str:
         stats_dataframe=stats_all,
         tissue=args.tissue,
         selection_metric=args.selection_metric,
+        expression_unit=args.expression_unit,
     )
 
     normalization_dir = OUTPUT_DIR / args.dataset_name / "Normalization"

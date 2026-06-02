@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Expression profiling metric functions and benchmarking for cross-species gene expression data."""
 
+expression_unit = "counts"
+
 import logging
 from pathlib import Path
 
@@ -20,7 +22,7 @@ logger = logging.getLogger(__name__)
 # ============================================================ #
 
 def net(vector: np.ndarray) -> float:
-    """Number of expressed tissues (TPM > 1)."""
+    """Number of expressed tissues (expression > 1)."""
     return float((vector > 1).sum())
 
 
@@ -82,20 +84,21 @@ def gini(vector: np.ndarray) -> float:
 # Computed directly on (human, mouse) expression vector pairs. #
 # ============================================================ #
 
-def met(df: pd.DataFrame, tissues: list[str]) -> pd.DataFrame:
+def met(df: pd.DataFrame, tissues: list[str], expression_unit: str = "tpm") -> pd.DataFrame:
     """Matched Expressed Tissues: fraction of tissues co-expressed in both species.
 
-    A gene is considered expressed if TPM >= 1. Score range: [0, 1].
+    A gene is considered expressed if expression >= 1. Score range: [0, 1].
 
     Args:
-        df: Input dataframe with TPM columns.
+        df: Input dataframe with expression columns.
         tissues: Tissue names in the dataset.
+        expression_unit: Expression unit (e.g., "tpm", "counts").
 
     Returns:
         Dataframe with added ``met`` column.
     """
-    h_cols = [f"{t}_tpm_human" for t in tissues]
-    m_cols = [f"{t}_tpm_mouse" for t in tissues]
+    h_cols = [f"{t}_{expression_unit}_human" for t in tissues]
+    m_cols = [f"{t}_{expression_unit}_mouse" for t in tissues]
 
     expr_h = (df[h_cols].values >= 1).astype(int) * 2 - 1  # 1 if expressed, -1 otherwise
     expr_m = (df[m_cols].values >= 1).astype(int) * 2 - 1
@@ -104,35 +107,37 @@ def met(df: pd.DataFrame, tissues: list[str]) -> pd.DataFrame:
     return df
 
 
-def ssd(df: pd.DataFrame, tissues: list[str]) -> pd.DataFrame:
+def ssd(df: pd.DataFrame, tissues: list[str], expression_unit: str = "tpm") -> pd.DataFrame:
     """Negative Sum of Squared Differences (higher = more similar profiles).
 
     Args:
-        df: Input dataframe with TPM columns.
+        df: Input dataframe with expression columns.
         tissues: Tissue names in the dataset.
+        expression_unit: Expression unit (e.g., "tpm", "counts").
 
     Returns:
         Dataframe with added ``ssd`` column.
     """
-    h_cols = [f"{t}_tpm_human" for t in tissues]
-    m_cols = [f"{t}_tpm_mouse" for t in tissues]
+    h_cols = [f"{t}_{expression_unit}_human" for t in tissues]
+    m_cols = [f"{t}_{expression_unit}_mouse" for t in tissues]
 
     df["ssd"] = -((df[m_cols].values - df[h_cols].values) ** 2).sum(axis=1)
     return df
 
 
-def cosine_sim(df: pd.DataFrame, tissues: list[str]) -> pd.DataFrame:
+def cosine_sim(df: pd.DataFrame, tissues: list[str], expression_unit: str = "tpm") -> pd.DataFrame:
     """Row-wise cosine similarity between human and mouse expression vectors.
 
     Args:
-        df: Input dataframe with TPM columns.
+        df: Input dataframe with expression columns.
         tissues: Tissue names in the dataset.
+        expression_unit: Expression unit (e.g., "tpm", "counts").
 
     Returns:
         Dataframe with added ``cosine_sim`` column.
     """
-    h_cols = [f"{t}_tpm_human" for t in tissues]
-    m_cols = [f"{t}_tpm_mouse" for t in tissues]
+    h_cols = [f"{t}_{expression_unit}_human" for t in tissues]
+    m_cols = [f"{t}_{expression_unit}_mouse" for t in tissues]
 
     A = df[h_cols].values
     B = df[m_cols].values
@@ -158,11 +163,11 @@ def _zscore(vector: np.ndarray) -> float:
 
     return zs
 
-def z_score_cosine_sim(df: pd.DataFrame, tissues: list[str]) -> pd.DataFrame:
+def z_score_cosine_sim(df: pd.DataFrame, tissues: list[str], expression_unit: str = "tpm") -> pd.DataFrame:
     """Row-wise cosine similarity between human and mouse z-score expression vectors."""
 
-    h_cols = [f"{t}_tpm_human" for t in tissues]
-    m_cols = [f"{t}_tpm_mouse" for t in tissues]
+    h_cols = [f"{t}_{expression_unit}_human" for t in tissues]
+    m_cols = [f"{t}_{expression_unit}_mouse" for t in tissues]
 
     missing_cols = sorted((set(h_cols) | set(m_cols)) - set(df.columns))
     if missing_cols:
@@ -207,6 +212,7 @@ def calculate_internal_metric(
     df: pd.DataFrame,
     metric_func,
     tissues: list[str],
+    expression_unit: str = "tpm"
 ) -> pd.DataFrame:
     """Apply a per-vector internal metric to human and mouse expression profiles.
 
@@ -214,17 +220,18 @@ def calculate_internal_metric(
     similarity score: ``sim = 1 - |human_score - mouse_score|``.
 
     Args:
-        df: Input dataframe with TPM columns.
+        df: Input dataframe with expression columns.
         metric_func: Per-vector metric function (e.g. ``gini``, ``tau``).
         tissues: Tissue names in the dataset.
-
+        expression_unit: Expression unit (e.g., "tpm", "counts").
+    
     Returns:
         Dataframe with added ``<metric>_human``, ``<metric>_mouse``,
         and ``<metric>_sim`` columns.
     """
     name   = metric_func.__name__
-    h_cols = [f"{t}_tpm_human" for t in tissues]
-    m_cols = [f"{t}_tpm_mouse" for t in tissues]
+    h_cols = [f"{t}_{expression_unit}_human" for t in tissues]
+    m_cols = [f"{t}_{expression_unit}_mouse" for t in tissues]
 
     df[f"{name}_human"] = df[h_cols].apply(lambda row: metric_func(row.values), axis=1)
     df[f"{name}_mouse"] = df[m_cols].apply(lambda row: metric_func(row.values), axis=1)
@@ -238,6 +245,7 @@ def apply_metrics(
     tissues: list[str],
     internal: list = INTERNAL_METRICS,
     external: list = EXTERNAL_METRICS,
+    expression_unit: str = "tpm",
 ) -> pd.DataFrame:
     """Apply all profiling metrics to a dataframe.
 
@@ -255,9 +263,9 @@ def apply_metrics(
     """
     df_out = df.copy()
     for func in internal:
-        df_out = calculate_internal_metric(df_out, func, tissues)
+        df_out = calculate_internal_metric(df_out, func, tissues, expression_unit)
     for func in external:
-        df_out = func(df_out, tissues)
+        df_out = func(df_out, tissues, expression_unit)
 
     logger.info("Applied %d profiling metrics.", len(internal) + len(external))
     return df_out
@@ -269,6 +277,7 @@ def apply_metric(
     df: pd.DataFrame,
     metric_name: str,
     tissues: list[str],
+    expression_unit: str = "tpm",
 ) -> pd.DataFrame:
     """
     Apply a single profiling metric to dataframe.
@@ -312,7 +321,7 @@ def apply_metric(
 
         metric_function = external[metric_name]
 
-        return metric_function(df_out, tissues)
+        return metric_function(df_out, tissues, expression_unit)
 
     # -----------------------------
     # Internal metric
@@ -331,6 +340,7 @@ def apply_metric(
             df_out,
             metric_function,
             tissues,
+            expression_unit
         )
 
     raise ValueError(

@@ -73,26 +73,48 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    parser.add_argument(
+        "--expression-unit",
+        default="tpm",
+        choices=["tpm", "counts"],
+    )
+
     return parser.parse_args()
 
 
 # -----------------------------
 # Helpers
 # -----------------------------
-def extract_tissues(dataframe: pd.DataFrame) -> list[str]:
-    """Extract tissue names from TPM column names."""
+def extract_tissues(
+    dataframe: pd.DataFrame,
+    expression_unit: str,
+) -> list[str]:
+    """Extract tissue names from expression columns."""
 
-    features = [
+    suffixes = {
+        f"_{expression_unit}_human",
+        f"_{expression_unit}_mouse",
+    }
+
+    expression_columns = [
         column
         for column in dataframe.columns
-        if column.split("_")[-2] == "tpm"
+        if any(column.endswith(suffix) for suffix in suffixes)
     ]
 
-    return sorted({
-        column.rsplit("_", 2)[0]
-        for column in features
+    if not expression_columns:
+        raise ValueError(
+            f"No expression columns found for expression_unit={expression_unit!r}. "
+            f"Expected columns like '<tissue>_{expression_unit}_human' and "
+            f"'<tissue>_{expression_unit}_mouse'."
+        )
+
+    tissues = sorted({
+        column.rsplit(f"_{expression_unit}_", 1)[0]
+        for column in expression_columns
     })
 
+    return tissues
 
 def copy_directory_contents(source_dir: Path, target_dir: Path) -> None:
     """Replace target_dir with a copy of source_dir."""
@@ -126,7 +148,7 @@ def main() -> str:
     logger.info("Loading expression dataset: %s", args.input)
     dataframe = pd.read_csv(args.input, sep="\t")
 
-    tissues = extract_tissues(dataframe)
+    tissues = extract_tissues(dataframe, expression_unit=args.expression_unit)
 
     logger.info("Detected %d tissues: %s", len(tissues), ", ".join(tissues))
 
@@ -145,6 +167,7 @@ def main() -> str:
         df=dataframe,
         df_name=args.dataset_name,
         output_dir=OUTPUT_DIR,
+        expression_unit=args.expression_unit,
     )
 
     # -----------------------------
@@ -154,12 +177,14 @@ def main() -> str:
     ortholog_metrics = pf.apply_metrics(
         df=dataframe,
         tissues=tissues,
+        expression_unit=args.expression_unit,
     )
 
     logger.info("Applying profiling metrics to all non-orthologous pairs.")
     nonortholog_metrics = pf.apply_metrics(
         df=nonortholog_dataframe,
         tissues=tissues,
+        expression_unit=args.expression_unit,
     )
 
     # -----------------------------
@@ -234,6 +259,7 @@ def main() -> str:
             tissues=tissues,
             promoter_path=args.promoter,
             output_dir=OUTPUT_DIR,
+            expression_unit=args.expression_unit,
         )
 
     # -----------------------------

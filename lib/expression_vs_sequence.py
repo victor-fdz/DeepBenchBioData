@@ -21,6 +21,7 @@ def expression_vs_sequence(
     tissues: list[str],
     promoter_path: Path,
     output_dir: Path,
+    expression_unit: str,
 ) -> Path:
     """Compare expression similarity against promoter sequence identity.
 
@@ -46,14 +47,18 @@ def expression_vs_sequence(
     metric_col  = metric_func_name if is_external else f"{metric_func_name}_sim"
 
     # Generate all possible gene pair combinations (cross join)
-    df = mod.all_pairs(df_path, df_name, output_dir)
-
+    df = mod.all_pairs(
+        df_path=df_path,
+        df_name=df_name,
+        output_dir=output_dir,
+        expression_unit=expression_unit,
+    )
     # Apply selected metric
     if is_external:
-        df = metric_func(df, tissues)
+        df = metric_func(df, tissues, expression_unit=expression_unit)  # External metrics may have custom handling
     else:
-        df = pf.calculate_internal_metric(df, metric_func, tissues)
-        df = pf.calculate_internal_metric(df, pf.gini, tissues)  # Add gini for tissue-specificity context
+        df = pf.calculate_internal_metric(df, metric_func, tissues, expression_unit=expression_unit)
+        df = pf.calculate_internal_metric(df, pf.gini, tissues, expression_unit=expression_unit)  # Add gini for tissue-specificity context
 
     # Orthology flag: pairs where gene names match are true orthologs
     df["orthology_flag"] = (

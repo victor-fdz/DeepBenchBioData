@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""Functions to generate non-orthologous and all-pairs gene expression datasets."""
+"""Functions to generate non-orthologous and all-pairs gene expression datasets.
+
+Supports both expression column formats:
+
+    <tissue>_tpm_<species>
+    <tissue>_counts_<species>
+
+Use expression_unit="tpm" or expression_unit="counts".
+Default is "tpm" to preserve backwards compatibility.
+"""
+
+expression_unit = "counts"
 
 import logging
 from pathlib import Path
@@ -14,18 +25,120 @@ logger = logging.getLogger(__name__)
 # -----------------------------
 MAX_SHUFFLE_RETRIES = 10
 ORTHOLOGY_LEAK_THRESHOLD = 0.001  # tolerated fraction of remaining true pairs
+DEFAULT_MAX_SAME_SPECIES_PAIRS = 1_000_000
+
+VALID_EXPRESSION_UNITS = {"tpm", "counts"}
 
 # reproducibility
 np.random.seed(0)
 
 
 # -----------------------------
-# Core: non-orthologous pairs
+# Shared helpers
+# -----------------------------
+def validate_expression_unit(expression_unit: str) -> None:
+    """Validate expression unit name."""
+
+    if expression_unit not in VALID_EXPRESSION_UNITS:
+        raise ValueError(
+            f"expression_unit must be one of {sorted(VALID_EXPRESSION_UNITS)}. "
+            f"Received: {expression_unit!r}"
+        )
+
+
+def get_gene_name_column(df: pd.DataFrame) -> str:
+    """Return the gene-name column used by the input dataframe.
+
+    Supported names:
+    - name_gene: current counts dataset
+    - gene_name: previous TPM pipeline
+    - Gene: auxiliary merged-table column
+    """
+
+    for column in ["name_gene", "gene_name", "Gene"]:
+        if column in df.columns:
+            return column
+
+    raise ValueError(
+        "Missing gene name column. Expected one of: name_gene, gene_name, Gene."
+    )
+
+
+def get_species_expression_columns(
+    df: pd.DataFrame,
+    species: str,
+    expression_unit: str = "tpm",
+) -> list[str]:
+    """Return expression columns for one species and one unit."""
+
+    validate_expression_unit(expression_unit)
+
+    suffix = f"_{expression_unit}_{species}"
+    columns = [column for column in df.columns if column.endswith(suffix)]
+
+    if not columns:
+        raise ValueError(
+            f"No expression columns found for species={species!r}, "
+            f"expression_unit={expression_unit!r}. Expected columns ending in {suffix!r}."
+        )
+
+    return columns
+
+
+def build_species_block(
+    df: pd.DataFrame,
+    species: str,
+    expression_unit: str = "tpm",
+) -> pd.DataFrame:
+    """Extract gene ID, gene name and expression columns for one species."""
+
+    validate_expression_unit(expression_unit)
+
+    gene_id_column = f"gene_id_{species}"
+    gene_name_column = get_gene_name_column(df)
+    expression_columns = get_species_expression_columns(
+        df=df,
+        species=species,
+        expression_unit=expression_unit,
+    )
+
+    required_columns = [gene_id_column, gene_name_column] + expression_columns
+    missing_columns = [column for column in required_columns if column not in df.columns]
+
+    if missing_columns:
+        raise ValueError(
+            f"Missing required columns for {species}: {missing_columns}"
+        )
+
+    return df[required_columns].rename(
+        columns={gene_name_column: f"gene_name_{species}"}
+    )
+
+
+def save_intermediate_dataset(
+    dataframe: pd.DataFrame,
+    output_dir: Path,
+    df_name: str,
+    filename: str,
+) -> Path:
+    """Save an intermediate dataset and return its path."""
+
+    out_path = output_dir / df_name / "Intermediate_Datasets" / filename
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    dataframe.to_csv(out_path, sep="\t", index=False)
+
+    return out_path
+
+
+# -----------------------------
+# Core: random non-orthologous pairs
 # -----------------------------
 def pairs_exchange(
     df: pd.DataFrame,
     df_name: str,
     output_dir: Path,
+    expression_unit: str = "tpm",
     _retries: int = 0,
 ) -> pd.DataFrame:
     """
@@ -36,43 +149,45 @@ def pairs_exchange(
     - shuffling mouse rows
     - recombining both datasets
 
-    A validation step ensures that residual matching gene IDs are below a threshold.
-
     Args:
-        - df (pd.DataFrame): Input expression dataframe with human/mouse columns
-        - df_name (str): Dataset name (used for output naming)
-        - output_dir (Path): Root output directory
-        - _retries (int): Internal retry counter (do not set manually)
+        df: Input expression dataframe with human/mouse columns.
+        df_name: Dataset name used for output naming.
+        output_dir: Root output directory.
+        expression_unit: Either "tpm" or "counts".
+        _retries: Internal retry counter. Do not set manually.
 
     Returns:
-        pd.DataFrame: Shuffled non-orthologous dataset
-
-    Raises:
-        RuntimeError: If valid shuffle cannot be achieved within retry limit
+        Shuffled non-orthologous dataframe.
     """
 
-    # stop recursion if shuffle fails repeatedly
+    validate_expression_unit(expression_unit)
+
     if _retries >= MAX_SHUFFLE_RETRIES:
         raise RuntimeError(
             f"Could not generate non-orthologous pairs after {MAX_SHUFFLE_RETRIES} attempts."
         )
 
-    # separate human and mouse expression blocks
-    human_cols = [c for c in df.columns if c.endswith("_human")] + ["gene_name"]
-    mouse_cols = [c for c in df.columns if c.endswith("_mouse")] + ["gene_name"]
+    human = build_species_block(
+        df=df,
+        species="human",
+        expression_unit=expression_unit,
+    )
 
-    human = df[human_cols].rename(columns={"gene_name": "gene_name_human"})
-    mouse = df[mouse_cols].rename(columns={"gene_name": "gene_name_mouse"})
+    mouse = build_species_block(
+        df=df,
+        species="mouse",
+        expression_unit=expression_unit,
+    )
 
-    # shuffle independently (break orthology structure)
+    # Shuffle independently to break orthology structure.
     shuffled_human = human.sample(frac=1).reset_index(drop=True)
     shuffled_mouse = mouse.sample(frac=1).reset_index(drop=True)
 
-    # split expression from identifiers
+    # Split expression from identifiers.
     expr_human = shuffled_human.drop(columns=["gene_name_human", "gene_id_human"])
     expr_mouse = shuffled_mouse.drop(columns=["gene_name_mouse", "gene_id_mouse"])
 
-    # recombine shuffled components
+    # Recombine shuffled components.
     shuffled_df = (
         shuffled_human[["gene_id_human"]]
         .join(shuffled_mouse[["gene_id_mouse"]])
@@ -82,7 +197,7 @@ def pairs_exchange(
         .join(expr_mouse)
     )
 
-    # validate remaining accidental (low by chance) true pairs
+    # Validate accidental remaining true pairs.
     leak = (shuffled_df["gene_id_human"] == shuffled_df["gene_id_mouse"]).mean()
 
     if leak > ORTHOLOGY_LEAK_THRESHOLD:
@@ -90,13 +205,20 @@ def pairs_exchange(
             "Orthology leak detected (%.2f%%). Retrying shuffle.",
             leak * 100,
         )
-        return pairs_exchange(df, df_name, output_dir, _retries=_retries + 1)
+        return pairs_exchange(
+            df=df,
+            df_name=df_name,
+            output_dir=output_dir,
+            expression_unit=expression_unit,
+            _retries=_retries + 1,
+        )
 
-    # save output
-    out_path = output_dir / df_name / "Intermediate_Datasets" / f"{df_name}_nonOrthologs.tsv"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    shuffled_df.to_csv(out_path, sep="\t", index=False)
+    out_path = save_intermediate_dataset(
+        dataframe=shuffled_df,
+        output_dir=output_dir,
+        df_name=df_name,
+        filename=f"{df_name}_nonOrthologs.tsv",
+    )
 
     logger.info("Non-orthologous dataset saved to %s", out_path)
 
@@ -104,93 +226,118 @@ def pairs_exchange(
 
 
 # -----------------------------
-# Core: all pairs generation
+# Core: all human x mouse pairs
 # -----------------------------
-def all_pairs(df_path: Path, df_name: str, output_dir: Path) -> pd.DataFrame:
+def all_pairs(
+    df_path: Path,
+    df_name: str,
+    output_dir: Path,
+    expression_unit: str = "tpm",
+) -> pd.DataFrame:
     """
-    Generate all possible human × mouse gene combinations (cross join).
-
-    This produces a full Cartesian product between human and mouse genes.
+    Generate all possible human x mouse gene combinations.
 
     Args:
-        - df_path (Path): Input TSV file path
-        - df_name (str): Dataset name (used for output naming)
-        - output_dir (Path): Root output directory
+        df_path: Input TSV file path.
+        df_name: Dataset name used for output naming.
+        output_dir: Root output directory.
+        expression_unit: Either "tpm" or "counts".
 
     Returns:
-        pd.DataFrame: Cross-product dataset of all gene pairs
+        Full human x mouse Cartesian product.
     """
 
-    # load input data
+    validate_expression_unit(expression_unit)
+
     df = pd.read_csv(df_path, sep="\t")
 
-    # split human and mouse columns
-    human_cols = [c for c in df.columns if "human" in c] + ["gene_name"]
-    mouse_cols = [c for c in df.columns if "mouse" in c] + ["gene_name"]
+    human = build_species_block(
+        df=df,
+        species="human",
+        expression_unit=expression_unit,
+    )
 
-    human = df[human_cols].rename(columns={"gene_name": "gene_name_human"})
-    mouse = df[mouse_cols].rename(columns={"gene_name": "gene_name_mouse"})
+    mouse = build_species_block(
+        df=df,
+        species="mouse",
+        expression_unit=expression_unit,
+    )
 
-    # Cartesian product (all-vs-all pairing)
     all_pairs_df = human.merge(mouse, how="cross")
 
-    # enforce column order (IDs → names → human TPM → mouse TPM)
     meta_human = ["gene_id_human", "gene_name_human"]
     meta_mouse = ["gene_id_mouse", "gene_name_mouse"]
 
-    tpm_human = human.drop(columns=meta_human).columns.tolist()
-    tpm_mouse = mouse.drop(columns=meta_mouse).columns.tolist()
+    expression_human = [
+        column for column in human.columns if column not in meta_human
+    ]
 
-    all_pairs_df = (
+    expression_mouse = [
+        column for column in mouse.columns if column not in meta_mouse
+    ]
+
+    column_order = (
         meta_human[:1]
         + meta_mouse[:1]
         + meta_human[1:]
         + meta_mouse[1:]
-        + tpm_human
-        + tpm_mouse
+        + expression_human
+        + expression_mouse
     )
 
-    all_pairs_df = human.merge(mouse, how="cross")[all_pairs_df]
+    all_pairs_df = all_pairs_df[column_order]
 
-    # save output
-    out_path = output_dir / df_name / "Intermediate_Datasets" / f"{df_name}_allPairs.tsv"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    all_pairs_df.to_csv(out_path, sep="\t", index=False)
+    out_path = save_intermediate_dataset(
+        dataframe=all_pairs_df,
+        output_dir=output_dir,
+        df_name=df_name,
+        filename=f"{df_name}_allPairs.tsv",
+    )
 
     logger.info("All-pairs dataset saved to %s", out_path)
 
     return all_pairs_df
 
 
-
+# -----------------------------
+# Core: all deterministic non-orthologous pairs
+# -----------------------------
 def all_nonortholog_pairs(
     df: pd.DataFrame,
     df_name: str,
     output_dir: Path,
+    expression_unit: str = "tpm",
 ) -> pd.DataFrame:
     """
-    Generate all possible human × mouse gene combinations and remove true orthologous pairs.
+    Generate all possible human x mouse gene combinations and remove true orthologous pairs.
 
-    This creates a deterministic non-ortholog background without random shuffling.
     True orthologs are removed using:
     - original gene_id_human / gene_id_mouse pairs from the input dataframe
     - matching gene_name_human / gene_name_mouse values, when available
 
     Args:
-        - df (pd.DataFrame): Input expression dataframe with paired human/mouse ortholog rows
-        - df_name (str): Dataset name used for output naming
-        - output_dir (Path): Root output directory
+        df: Input expression dataframe with paired human/mouse ortholog rows.
+        df_name: Dataset name used for output naming.
+        output_dir: Root output directory.
+        expression_unit: Either "tpm" or "counts".
 
     Returns:
-        pd.DataFrame: All non-orthologous human × mouse pairs
+        All non-orthologous human x mouse pairs.
     """
 
-    human_cols = [c for c in df.columns if "human" in c] + ["gene_name"]
-    mouse_cols = [c for c in df.columns if "mouse" in c] + ["gene_name"]
+    validate_expression_unit(expression_unit)
 
-    human = df[human_cols].rename(columns={"gene_name": "gene_name_human"})
-    mouse = df[mouse_cols].rename(columns={"gene_name": "gene_name_mouse"})
+    human = build_species_block(
+        df=df,
+        species="human",
+        expression_unit=expression_unit,
+    )
+
+    mouse = build_species_block(
+        df=df,
+        species="mouse",
+        expression_unit=expression_unit,
+    )
 
     all_pairs_df = human.merge(mouse, how="cross")
 
@@ -224,16 +371,12 @@ def all_nonortholog_pairs(
     meta_human = ["gene_id_human", "gene_name_human"]
     meta_mouse = ["gene_id_mouse", "gene_name_mouse"]
 
-    tpm_human = [
-        column
-        for column in human.columns
-        if column not in meta_human
+    expression_human = [
+        column for column in human.columns if column not in meta_human
     ]
 
-    tpm_mouse = [
-        column
-        for column in mouse.columns
-        if column not in meta_mouse
+    expression_mouse = [
+        column for column in mouse.columns if column not in meta_mouse
     ]
 
     column_order = (
@@ -241,20 +384,18 @@ def all_nonortholog_pairs(
         + meta_mouse[:1]
         + meta_human[1:]
         + meta_mouse[1:]
-        + tpm_human
-        + tpm_mouse
+        + expression_human
+        + expression_mouse
     )
 
     nonortholog_df = nonortholog_df[column_order]
 
-    out_path = (
-        output_dir
-        / df_name
-        / "Intermediate_Datasets"
-        / f"{df_name}_allNonOrthologs.tsv"
+    out_path = save_intermediate_dataset(
+        dataframe=nonortholog_df,
+        output_dir=output_dir,
+        df_name=df_name,
+        filename=f"{df_name}_allNonOrthologs.tsv",
     )
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    nonortholog_df.to_csv(out_path, sep="\t", index=False)
 
     logger.info(
         "All non-orthologous pairs saved to %s (%d pairs).",
@@ -264,16 +405,16 @@ def all_nonortholog_pairs(
 
     return nonortholog_df
 
+
 # -----------------------------
 # Core: same-species pair generation
 # -----------------------------
-DEFAULT_MAX_SAME_SPECIES_PAIRS = 1_000_000
-
 def same_species_pairs(
     df: pd.DataFrame,
     species: str,
     df_name: str,
     output_dir: Path,
+    expression_unit: str = "tpm",
     include_self_pairs: bool = False,
     max_pairs: int = DEFAULT_MAX_SAME_SPECIES_PAIRS,
 ) -> pd.DataFrame:
@@ -284,23 +425,26 @@ def same_species_pairs(
         gene_id_1, gene_id_2, gene_name_1, gene_name_2
 
     For compatibility with existing profiling functions, expression columns are
-    still mapped to the two branch slots used by the cross-species code:
-        <tissue>_tpm_human = branch 1
-        <tissue>_tpm_mouse = branch 2
+    mapped to the two branch slots used by the cross-species code:
+
+        <tissue>_<expression_unit>_human = branch 1
+        <tissue>_<expression_unit>_mouse = branch 2
 
     The real species is stored in source_species.
     """
 
+    validate_expression_unit(expression_unit)
+
     if species not in {"human", "mouse"}:
         raise ValueError("species must be either 'human' or 'mouse'.")
 
-    species_columns = [c for c in df.columns if c.endswith(f"_{species}")] + ["gene_name"]
-    entries = df[species_columns].copy()
-    entries = entries.rename(columns={"gene_name": f"gene_name_{species}"})
+    entries = build_species_block(
+        df=df,
+        species=species,
+        expression_unit=expression_unit,
+    )
 
     gene_id_column = f"gene_id_{species}"
-    if gene_id_column not in entries.columns:
-        raise KeyError(f"Missing required column: {gene_id_column}")
 
     entries = entries.drop_duplicates(subset=[gene_id_column]).reset_index(drop=True)
 
@@ -317,21 +461,33 @@ def same_species_pairs(
 
     first_gene = f"{gene_id_column}_1"
     second_gene = f"{gene_id_column}_2"
-    keep = pairs[first_gene].le(pairs[second_gene]) if include_self_pairs else pairs[first_gene].lt(pairs[second_gene])
+
+    if include_self_pairs:
+        keep = pairs[first_gene].le(pairs[second_gene])
+    else:
+        keep = pairs[first_gene].lt(pairs[second_gene])
+
     pairs = pairs[keep].reset_index(drop=True)
 
-    canonical = _canonicalize_same_species_pairs(pairs, species)
-
-    out_path = (
-        output_dir /
-        df_name /
-        "Intermediate_Datasets" /
-        f"{df_name}_{species}_{species}_pairs.tsv"
+    canonical = _canonicalize_same_species_pairs(
+        pairs=pairs,
+        species=species,
+        expression_unit=expression_unit,
     )
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    canonical.to_csv(out_path, sep="\t", index=False)
 
-    logger.info("Same-species %s-%s pairs saved to %s", species, species, out_path)
+    out_path = save_intermediate_dataset(
+        dataframe=canonical,
+        output_dir=output_dir,
+        df_name=df_name,
+        filename=f"{df_name}_{species}_{species}_pairs.tsv",
+    )
+
+    logger.info(
+        "Same-species %s-%s pairs saved to %s",
+        species,
+        species,
+        out_path,
+    )
 
     return canonical
 
@@ -339,37 +495,64 @@ def same_species_pairs(
 def _canonicalize_same_species_pairs(
     pairs: pd.DataFrame,
     species: str,
+    expression_unit: str = "tpm",
 ) -> pd.DataFrame:
     """
     Convert species-specific pair columns into a species-neutral two-branch schema.
 
-    Example for mouse-mouse:
-        gene_id_mouse_1      -> gene_id_1
-        gene_id_mouse_2      -> gene_id_2
-        liver_tpm_mouse_1    -> liver_tpm_human  # branch 1 for profiling
-        liver_tpm_mouse_2    -> liver_tpm_mouse  # branch 2 for profiling
+    Example for mouse-mouse with expression_unit="counts":
+
+        gene_id_mouse_1             -> gene_id_1
+        gene_id_mouse_2             -> gene_id_2
+        liver_counts_mouse_1        -> liver_counts_human
+        liver_counts_mouse_2        -> liver_counts_mouse
+
+    In this context, "_human" and "_mouse" mean branch 1 and branch 2,
+    not biological species.
     """
+
+    validate_expression_unit(expression_unit)
 
     rename_map: dict[str, str] = {}
 
-    for col in pairs.columns:
-        if col == f"gene_id_{species}_1":
-            rename_map[col] = "gene_id_1"
-        elif col == f"gene_id_{species}_2":
-            rename_map[col] = "gene_id_2"
-        elif col == f"gene_name_{species}_1":
-            rename_map[col] = "gene_name_1"
-        elif col == f"gene_name_{species}_2":
-            rename_map[col] = "gene_name_2"
-        elif col.endswith(f"_tpm_{species}_1"):
-            rename_map[col] = col.replace(f"_tpm_{species}_1", "_tpm_human")
-        elif col.endswith(f"_tpm_{species}_2"):
-            rename_map[col] = col.replace(f"_tpm_{species}_2", "_tpm_mouse")
+    for column in pairs.columns:
+        if column == f"gene_id_{species}_1":
+            rename_map[column] = "gene_id_1"
+
+        elif column == f"gene_id_{species}_2":
+            rename_map[column] = "gene_id_2"
+
+        elif column == f"gene_name_{species}_1":
+            rename_map[column] = "gene_name_1"
+
+        elif column == f"gene_name_{species}_2":
+            rename_map[column] = "gene_name_2"
+
+        elif column.endswith(f"_{expression_unit}_{species}_1"):
+            rename_map[column] = column.replace(
+                f"_{expression_unit}_{species}_1",
+                f"_{expression_unit}_human",
+            )
+
+        elif column.endswith(f"_{expression_unit}_{species}_2"):
+            rename_map[column] = column.replace(
+                f"_{expression_unit}_{species}_2",
+                f"_{expression_unit}_mouse",
+            )
 
     out = pairs.rename(columns=rename_map)
     out["source_species"] = species
 
-    meta = ["gene_id_1", "gene_id_2", "gene_name_1", "gene_name_2", "source_species"]
-    tpm_cols = [c for c in out.columns if c not in meta]
+    meta = [
+        "gene_id_1",
+        "gene_id_2",
+        "gene_name_1",
+        "gene_name_2",
+        "source_species",
+    ]
 
-    return out[meta + tpm_cols]
+    expression_columns = [
+        column for column in out.columns if column not in meta
+    ]
+
+    return out[meta + expression_columns]

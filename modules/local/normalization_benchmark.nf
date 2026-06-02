@@ -29,6 +29,7 @@ process NORMALIZATION_BENCHMARK {
         --dataset-name ${dataset_name} \
         --tissue ${params.normalization_tissue} \
         --selection-metric ${params.normalization_selection_metric} \
+        --expression-unit ${params.expression_unit}
         ${selected_methods_argument}
     """
 }

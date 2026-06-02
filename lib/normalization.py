@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Normalization functions for cross-species gene expression TPM data."""
 
+expression_unit = "counts"
+
 import logging
 from pathlib import Path
 from typing import Callable
@@ -117,7 +119,7 @@ def quantile_norm(df: pd.DataFrame, numeric_cols: list[str]) -> pd.DataFrame:
     return df_out
 
 
-def quantile_sample_norm(df: pd.DataFrame, numeric_cols: list[str]) -> pd.DataFrame:
+def quantile_sample_norm(df: pd.DataFrame, numeric_cols: list[str], expression_unit="tpm") -> pd.DataFrame:
     """
     Apply quantile normalization per tissue.
 
@@ -134,10 +136,11 @@ def quantile_sample_norm(df: pd.DataFrame, numeric_cols: list[str]) -> pd.DataFr
     df_out = df.copy()
 
     # extract tissues from column names
-    tissues = list({c.rsplit("_tpm_", 1)[0] for c in numeric_cols if "_tpm_" in c})
+    tissues = list({c.rsplit(f"_{expression_unit}_", 1)[0] for c in numeric_cols if f"_{expression_unit}_" in c})
+    
 
     for tissue in tissues:
-        cols = [f"{tissue}_tpm_human", f"{tissue}_tpm_mouse"]
+        cols = [f"{tissue}_{expression_unit}_human", f"{tissue}_{expression_unit}_mouse"]
 
         # reuse quantile_norm on subset
         df_out[cols] = quantile_norm(df_out, cols)[cols]
@@ -266,39 +269,6 @@ def edger_tmm_norm(df: pd.DataFrame, numeric_cols: list[str]) -> pd.DataFrame:
 
     return df_out
 
-def invented_norm(df: pd.DataFrame, numeric_cols: list[str]) -> pd.DataFrame:
-    """
-    Placeholder for an invented normalization method.
-
-    This is a stub function to demonstrate how to add new methods to the pipeline.
-
-    Args:
-        - df (pd.DataFrame): Input dataframe
-        - numeric_cols (list[str]): Columns to normalize    
-    Returns:
-        pd.DataFrame: Normalized dataframe
-    """
-    df_out = df.copy()
-
-    # Example: divide each value of the gene by the mean of the row (gene-wise mean normalization)
-    row_means = df_out[numeric_cols].mean(axis=1)
-    df_out[numeric_cols] = df_out[numeric_cols].div(row_means, axis=0)
-    return df_out
-
-
-def no_norm(df: pd.DataFrame, numeric_cols: list[str]) -> pd.DataFrame:
-    """
-    No normalization (identity function).
-
-    Args:
-        - df (pd.DataFrame): Input dataframe
-        - numeric_cols (list[str]): Columns to "normalize" (ignored)
-
-    Returns:
-        pd.DataFrame: Unchanged dataframe
-    """
-    return df.copy()
-
 # -----------------------------
 # Method registry
 # -----------------------------
@@ -310,8 +280,6 @@ NORMALIZATION_METHODS = [
     quantile_sample_norm,
     deseq2_norm,
     edger_tmm_norm,
-    invented_norm,
-    no_norm
 ]
 
 
@@ -346,7 +314,10 @@ def apply_normalizations(
 
     # apply each normalization
     for method in methods:
-        df_norm = method(df, numeric_cols=features)
+        if method == quantile_sample_norm:
+            df_norm = method(df, numeric_cols=features, expression_unit=expression_unit)
+        else:
+            df_norm = method(df, numeric_cols=features)
 
         df_norm.to_csv(
             out_dir / f"{orthology}_{df_name}_{method.__name__}.tsv",

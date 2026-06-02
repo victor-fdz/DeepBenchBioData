@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Compute correlation statistics for normalized datasets."""
 
+expression_unit = "counts"
+
 import logging
 from pathlib import Path
 
@@ -19,6 +21,7 @@ def compute_stats(
     features: list[str],
     tissues: list[str],
     orthology: str,
+    expression_unit: str = "tpm"
 ) -> pd.DataFrame:
     """
     Compute Pearson and Spearman correlations for all methods and tissues.
@@ -26,9 +29,10 @@ def compute_stats(
     Args:
         - dfs (list[pd.DataFrame]): Normalized expression dataframes
         - dfs_names (list[str]): Method names corresponding to dfs
-        - features (list[str]): TPM feature columns (unused but kept for pipeline consistency)
+        - features (list[str]): Expression feature columns (unused but kept for pipeline consistency)
         - tissues (list[str]): Tissue names
         - orthology (str): Orthology type (Orthologs / NonOrthologs)
+        - expression_unit (str): Expression unit (e.g., "tpm", "counts")
 
     Returns:
         pd.DataFrame: Table with correlation statistics per tissue and method
@@ -47,11 +51,11 @@ def compute_stats(
             # extract expression vectors
             # -----------------------------
             if tissue == "General":
-                human_vals = df[[f"{t}_tpm_human" for t in tissues]].values.flatten()
-                mouse_vals = df[[f"{t}_tpm_mouse" for t in tissues]].values.flatten()
+                human_vals = df[[f"{t}_{expression_unit}_human" for t in tissues]].values.flatten()
+                mouse_vals = df[[f"{t}_{expression_unit}_mouse" for t in tissues]].values.flatten()
             else:
-                human_vals = df[f"{tissue}_tpm_human"]
-                mouse_vals = df[f"{tissue}_tpm_mouse"]
+                human_vals = df[f"{tissue}_{expression_unit}_human"]
+                mouse_vals = df[f"{tissue}_{expression_unit}_mouse"]
 
             # -----------------------------
             # correlation computation
@@ -229,47 +233,41 @@ def best_method(
     df_name: str,
     tissue_criteria: str,
     output_dir: Path,
+    expression_unit: str = "tpm",
+    ranking_column: str = "Pearson_R_increment",
 ) -> str:
-    """
-    Select best normalization method based on increment statistics.
+    """Select best normalization method based on increment statistics."""
 
-    Displays top candidates and asks user for selection.
-
-    Args:
-        - df_name (str): Dataset name
-        - tissue_criteria (str): Tissue used for ranking
-        - output_dir (Path): Output directory
-
-    Returns:
-        str: Selected method name
-    """
-
-    # load computed stats
     stats_path = output_dir / df_name / "Normalization" / f"{df_name}_stats.tsv"
     df = pd.read_csv(stats_path, sep="\t")
 
-    # filter tissue of interest
-    df = df[df["tissue"] == tissue_criteria]
+    df = df[df["tissue"] == tissue_criteria].copy()
 
-    # rank methods
-    top_pearson = df.nlargest(5, "Pearson_R_increment")[
-        ["method", "Pearson_R_increment"]
-    ]
+    if df.empty:
+        raise ValueError(f"No stats found for tissue: {tissue_criteria}")
 
-    top_spearman = df.nlargest(5, "Spearman_rho_increment")[
-        ["method", "Spearman_rho_increment"]
-    ]
+    if ranking_column not in df.columns:
+        raise ValueError(f"Missing ranking column: {ranking_column}")
 
-    # display ranking
-    print("\nTop 5 methods by Pearson R increment:")
-    print(top_pearson.to_string(index=False))
+    df = df.sort_values(ranking_column, ascending=False).reset_index(drop=True)
 
-    print("\nTop 5 methods by Spearman Rho increment:")
-    print(top_spearman.to_string(index=False))
+    print(f"\nTop 5 methods by {ranking_column}:")
+    print(df.head(5)[["method", ranking_column]].to_string(index=False))
 
-    # user selection
-    chosen = input("Enter method name to use:\n").strip()
+    selected_method = str(df.loc[0, "method"])
 
-    logger.info("User selected method: %s", chosen)
+    if expression_unit == "counts" and selected_method == "original":
+        if len(df) < 2:
+            raise ValueError(
+                "Best method is 'original' for raw counts, but no second method is available."
+            )
 
-    return chosen
+        logger.warning(
+            "Best method was 'original' with raw counts. Selecting second-best method instead."
+        )
+
+        selected_method = str(df.loc[1, "method"])
+
+    logger.info("Selected normalization method: %s", selected_method)
+
+    return selected_method

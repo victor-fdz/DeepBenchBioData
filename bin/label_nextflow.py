@@ -45,17 +45,17 @@ OUTPUT_DIR = Path(".")
 # Helpers
 # -----------------------------
 def get_feature_columns(dataframe: pd.DataFrame) -> list[str]:
-    """Extract TPM feature columns from dataframe."""
+    """Extract feature columns from dataframe."""
 
     return [
         column
         for column in dataframe.columns
-        if column.split("_")[-2] == "tpm"
+        if column.split("_")[-2] == args.expression_unit
     ]
 
 
 def get_tissues(features: list[str]) -> list[str]:
-    """Extract tissue names from TPM columns."""
+    """Extract tissue names from expression columns."""
 
     return sorted({
         column.rsplit("_", 2)[0]
@@ -266,6 +266,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-pos", type=int, default=10000)
     parser.add_argument("--n-neg", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=42)
+
+    parser.add_argument(
+        "--expression-unit",
+        default="tpm",
+        choices=["tpm", "counts"],
+    )
 
     return parser.parse_args()
 

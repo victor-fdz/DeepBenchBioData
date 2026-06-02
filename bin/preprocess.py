@@ -67,6 +67,12 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--seed", type=int, default=42)
 
+    parser.add_argument(
+        "--expression-unit",
+        default="tpm",
+        choices=["tpm", "counts"],
+    )
+
     return parser.parse_args()
 
 
@@ -87,6 +93,8 @@ def main():
                 str(args.input),
                 "--name",
                 args.name,
+                "--expression-unit",
+                args.expression_unit,
             ]
         )
 
@@ -113,6 +121,8 @@ def main():
                 str(args.input),
                 "--name",
                 args.name,
+                "--expression-unit",
+                args.expression_unit,
             ]
         )
 
@@ -139,6 +149,8 @@ def main():
         str(args.n_neg),
         "--seed",
         str(args.seed),
+        "--expression-unit",
+        args.expression_unit,
     ]
 
     out_path = run_labeling(labeling_args)
