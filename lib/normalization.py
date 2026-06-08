@@ -266,39 +266,6 @@ def edger_tmm_norm(df: pd.DataFrame, numeric_cols: list[str]) -> pd.DataFrame:
 
     return df_out
 
-def invented_norm(df: pd.DataFrame, numeric_cols: list[str]) -> pd.DataFrame:
-    """
-    Placeholder for an invented normalization method.
-
-    This is a stub function to demonstrate how to add new methods to the pipeline.
-
-    Args:
-        - df (pd.DataFrame): Input dataframe
-        - numeric_cols (list[str]): Columns to normalize    
-    Returns:
-        pd.DataFrame: Normalized dataframe
-    """
-    df_out = df.copy()
-
-    # Example: divide each value of the gene by the mean of the row (gene-wise mean normalization)
-    row_means = df_out[numeric_cols].mean(axis=1)
-    df_out[numeric_cols] = df_out[numeric_cols].div(row_means, axis=0)
-    return df_out
-
-
-def no_norm(df: pd.DataFrame, numeric_cols: list[str]) -> pd.DataFrame:
-    """
-    No normalization (identity function).
-
-    Args:
-        - df (pd.DataFrame): Input dataframe
-        - numeric_cols (list[str]): Columns to "normalize" (ignored)
-
-    Returns:
-        pd.DataFrame: Unchanged dataframe
-    """
-    return df.copy()
-
 # -----------------------------
 # Method registry
 # -----------------------------
@@ -310,8 +277,6 @@ NORMALIZATION_METHODS = [
     quantile_sample_norm,
     deseq2_norm,
     edger_tmm_norm,
-    invented_norm,
-    no_norm
 ]
 
 

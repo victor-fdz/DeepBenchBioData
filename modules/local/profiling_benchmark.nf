@@ -5,7 +5,7 @@ process PROFILING_BENCHMARK {
 
     input:
     tuple val(dataset_name), path(raw_expression_dataset)
-
+    
     output:
     tuple val(dataset_name),
           path("Profiling/best_metric.txt"),
@@ -25,4 +25,4 @@ process PROFILING_BENCHMARK {
         --dataset-name ${dataset_name} \
         ${promoter_argument}
     """
-}
+    }

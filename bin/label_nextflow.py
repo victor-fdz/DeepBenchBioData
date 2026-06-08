@@ -50,7 +50,7 @@ def get_feature_columns(dataframe: pd.DataFrame) -> list[str]:
     return [
         column
         for column in dataframe.columns
-        if column.split("_")[-2] == "tpm"
+        if len(column.split("_"))>2 and column.split("_")[-2] == "tpm"
     ]
 
 

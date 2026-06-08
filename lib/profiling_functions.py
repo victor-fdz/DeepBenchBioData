@@ -158,8 +158,16 @@ def _zscore(vector: np.ndarray) -> float:
 
     return zs
 
+
+import numpy as np
+import pandas as pd
+
 def z_score_cosine_sim(df: pd.DataFrame, tissues: list[str]) -> pd.DataFrame:
-    """Row-wise cosine similarity between human and mouse z-score expression vectors."""
+    """Row-wise cosine similarity between human and mouse z-score expression vectors.
+    
+    If a vector has 0 variance (e.g., all values are identical), the raw profile 
+    is preserved as-is instead of raising an error or producing NaNs.
+    """
 
     h_cols = [f"{t}_tpm_human" for t in tissues]
     m_cols = [f"{t}_tpm_mouse" for t in tissues]
@@ -171,27 +179,43 @@ def z_score_cosine_sim(df: pd.DataFrame, tissues: list[str]) -> pd.DataFrame:
     human_values = df[h_cols].to_numpy(dtype=float)
     mouse_values = df[m_cols].to_numpy(dtype=float)
 
+    # 1. Calculate means and standard deviations
+    human_mean = human_values.mean(axis=1, keepdims=True)
+    mouse_mean = mouse_values.mean(axis=1, keepdims=True)
+    
     human_std = human_values.std(axis=1, ddof=1)
     mouse_std = mouse_values.std(axis=1, ddof=1)
 
-    if (human_std == 0).any() or (mouse_std == 0).any():
-        raise ValueError(
-            "Cannot compute z_score_cosine_sim for rows with zero expression variance."
-        )
+    # 2. Compute Z-scores safely
+    # If std is 0, we divide by 1 to pass the raw unscaled differences (which will be 0)
+    h_divisor = np.where(human_std == 0, 1.0, human_std)[:, None]
+    m_divisor = np.where(mouse_std == 0, 1.0, mouse_std)[:, None]
 
-    human_z = (human_values - human_values.mean(axis=1, keepdims=True)) / human_std[:, None]
-    mouse_z = (mouse_values - mouse_values.mean(axis=1, keepdims=True)) / mouse_std[:, None]
+    human_z = (human_values - human_mean) / h_divisor
+    mouse_z = (mouse_values - mouse_mean) / m_divisor
 
+    # 3. Calculate Dot Product and Norms
     dot = np.sum(human_z * mouse_z, axis=1)
-    norm = np.linalg.norm(human_z, axis=1) * np.linalg.norm(mouse_z, axis=1)
+    
+    norm_h = np.linalg.norm(human_z, axis=1)
+    norm_m = np.linalg.norm(mouse_z, axis=1)
+    norm = norm_h * norm_m
 
-    if (norm == 0).any():
-        raise ValueError("Cannot compute z_score_cosine_sim for zero-norm rows.")
+    # 4. Handle Zero Norms safely
+    # If a vector had zero variance, its mean-centered values are all 0, making its norm 0.
+    # We assign a similarity score of 1.0 if BOTH are zero-variance, or 0.0 if only one is.
+    both_zero_variance = (human_std == 0) & (mouse_std == 0)
+    
+    # Avoid division by zero warnings by temporarily setting 0 norms to 1.0
+    safe_norm = np.where(norm == 0, 1.0, norm)
+    similarity = dot / safe_norm
 
-    df["z_score_cosine_sim"] = dot / norm
+    # Overwrite the zero-norm rows with logical defaults instead of crashing
+    similarity = np.where(norm == 0, np.where(both_zero_variance, 1.0, 0.0), similarity)
+
+    df["z_score_cosine_sim"] = similarity
 
     return df
-
 
 # Canonical ordered method lists
 INTERNAL_METRICS = [net, shannon, tau, gini]

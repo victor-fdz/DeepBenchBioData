@@ -5,9 +5,9 @@ process NORMALIZATION_BENCHMARK {
 
     input:
     tuple val(dataset_name), path(raw_expression_dataset)
-
+    
     output:
-    tuple val(dataset_name),
+    tuple val(dataset_name),      
           path("Normalization/best_method.txt"),
           path("Normalization/normalization_method_ranking.tsv"),
           path("Normalization/normalization_manifest.json"),

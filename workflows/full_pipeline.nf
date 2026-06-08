@@ -1,8 +1,8 @@
 include { NORMALIZATION_BENCHMARK } from '../modules/local/normalization_benchmark'
 include { PROFILING_BENCHMARK } from '../modules/local/profiling_benchmark'
-include { LABEL_GENE_PAIRS_FROM_BENCHMARKS } from '../modules/local/label_gene_pairs_from_benchmarks'
-include { ENCODE_AND_SPLIT_PAIRS_FROM_BENCHMARKS } from '../modules/local/encode_and_split_pairs_from_benchmarks'
-include { TRAIN_AND_EVALUATE_MODEL_FROM_BENCHMARKS } from '../modules/local/train_and_evaluate_model_from_benchmarks'
+include { LABEL_GENE_PAIRS } from '../modules/local/label_gene_pairs'
+include { ENCODE_AND_SPLIT_PAIRS} from '../modules/local/encode_and_split_pairs'
+include { TRAIN_AND_EVALUATE_MODEL } from '../modules/local/train_and_evaluate_model'
 
 workflow FULL_PIPELINE {
     take:
@@ -35,17 +35,17 @@ workflow FULL_PIPELINE {
         .join(selected_normalization_channel)
         .join(selected_profiling_channel)
 
-    LABEL_GENE_PAIRS_FROM_BENCHMARKS(labeling_input_channel)
+    LABEL_GENE_PAIRS(labeling_input_channel)
 
     /*
      * Step 3: encoding and splitting
      * Uses labeled pairs plus the selected profiling metric.
      */
-    encoding_input_channel = LABEL_GENE_PAIRS_FROM_BENCHMARKS.out.labeled_pairs.map { result_tuple ->
+    encoding_input_channel = LABEL_GENE_PAIRS.out.labeled_pairs.map { result_tuple ->
         tuple(result_tuple[0], result_tuple[1], result_tuple[3])
     }
 
-    ENCODE_AND_SPLIT_PAIRS_FROM_BENCHMARKS(
+    ENCODE_AND_SPLIT_PAIRS(
         encoding_input_channel,
         human_fasta_channel,
         mouse_fasta_channel,
@@ -56,16 +56,16 @@ workflow FULL_PIPELINE {
      * Step 4: model training/evaluation
      * Uses train/validation/test splits plus the selected profiling metric.
      */
-    model_input_channel = ENCODE_AND_SPLIT_PAIRS_FROM_BENCHMARKS.out.split_files.map { result_tuple ->
+    model_input_channel = ENCODE_AND_SPLIT_PAIRS.out.split_files.map { result_tuple ->
         tuple(result_tuple[0], result_tuple[1], result_tuple[2], result_tuple[3], result_tuple[4])
     }
 
-    TRAIN_AND_EVALUATE_MODEL_FROM_BENCHMARKS(model_input_channel)
+    TRAIN_AND_EVALUATE_MODEL(model_input_channel)
 
     emit:
     normalization = NORMALIZATION_BENCHMARK.out.results
     profiling = PROFILING_BENCHMARK.out.results
-    labeling = LABEL_GENE_PAIRS_FROM_BENCHMARKS.out.labeled_pairs
-    encoding = ENCODE_AND_SPLIT_PAIRS_FROM_BENCHMARKS.out.split_files
-    model = TRAIN_AND_EVALUATE_MODEL_FROM_BENCHMARKS.out.model_outputs
+    labeling = LABEL_GENE_PAIRS.out.labeled_pairs
+    encoding = ENCODE_AND_SPLIT_PAIRS.out.split_files
+    model = TRAIN_AND_EVALUATE_MODEL.out.model_outputs
 }
