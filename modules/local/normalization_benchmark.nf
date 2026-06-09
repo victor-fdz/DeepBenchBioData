@@ -14,7 +14,7 @@ process NORMALIZATION_BENCHMARK {
           path("Normalization/${dataset_name}_stats.tsv"),
           path("Normalization/Orthologs_scatter.png"),
           path("Normalization/NonOrthologs_scatter.png"),
-          path("Normalization/Increment_PearsonR_heatmap.png"),
+          path("Normalization/Increment_*_heatmap.png"),
           path("Orthologs"),
           path("NonOrthologs"),
           path("Intermediate_Datasets"),
