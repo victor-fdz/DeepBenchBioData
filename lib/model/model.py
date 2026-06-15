@@ -28,6 +28,7 @@ class SiameseCNN(nn.Module):
         large_kernel_size: int = 20,
         attention_heads: int = 4,
         embedding_dim: int = 16,
+        transformer_layers: int = 1,
     ) -> None:
         super().__init__()
 
@@ -55,6 +56,7 @@ class SiameseCNN(nn.Module):
             "large_kernel_size": int(large_kernel_size),
             "attention_heads": int(attention_heads),
             "embedding_dim": int(embedding_dim),
+            "transformer_layers": int(transformer_layers),
         }
 
         self.conv_s = nn.Conv1d(
@@ -91,14 +93,26 @@ class SiameseCNN(nn.Module):
         self.bn2 = nn.BatchNorm1d(32)
         self.drop2 = nn.Dropout(p=dropout_rate)
 
-        self.attention = nn.MultiheadAttention(
-            embed_dim=32,
-            num_heads=attention_heads,
-            batch_first=True,
-        )
+        self.max_transformer_length = 256
 
-        self.attention_norm = nn.LayerNorm(32)
-        self.attention_dropout = nn.Dropout(p=dropout_rate)
+        self.position_embedding = nn.Parameter(
+            torch.zeros(1, self.max_transformer_length, 32)
+            )
+
+        transformer_layer = nn.TransformerEncoderLayer(
+            d_model=32,
+            nhead=attention_heads,
+            dim_feedforward=32,
+            dropout=dropout_rate,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+            )
+
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer=transformer_layer,
+            num_layers=transformer_layers,
+            )        
 
         self.gap = nn.AdaptiveAvgPool1d(1)
         self.drop3 = nn.Dropout(p=dropout_rate)
@@ -133,18 +147,28 @@ class SiameseCNN(nn.Module):
         x = self.drop2(self.bn2(x))
         x = F.max_pool1d(x, kernel_size=2)
 
-        attention_input = x.transpose(1, 2)
 
-        attention_output, _ = self.attention(
-            attention_input,
-            attention_input,
-            attention_input,
+        # ================ TRANSFORMER ================
+        transformer_input = x.transpose(1, 2)
+
+        sequence_length = transformer_input.shape[1]
+
+        if sequence_length > self.max_transformer_length:
+            raise ValueError(
+                f"Transformer input length {sequence_length} exceeds "
+                f"max_transformer_length={self.max_transformer_length}."
+            )
+
+        transformer_input = (
+            transformer_input
+            + self.position_embedding[:, :sequence_length, :]
         )
 
-        attention_output = self.attention_dropout(attention_output)
-        attention_output = self.attention_norm(attention_input + attention_output)
+        transformer_output = self.transformer_encoder(transformer_input)
 
-        x = attention_output.transpose(1, 2)
+        x = transformer_output.transpose(1, 2)
+        # ===========================================
+
 
         x = self.gap(x).squeeze(-1)
         x = self.fc(self.drop3(x))

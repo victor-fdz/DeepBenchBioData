@@ -300,7 +300,7 @@ def main() -> str:
         stats_all,
         args.dataset_name,
         sorted_methods,
-        "Pearson_R",
+        "Spearman_rho",
         "Increment",
         OUTPUT_DIR,
     )

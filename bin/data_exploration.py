@@ -1,566 +1,387 @@
-#!/usr/bin/env python3
-"""Initial data exploration plots for paired human and mouse expression datasets.
-
-Main outputs:
-- pca_by_tissue.png
-- pca_species_and_arrows.png
-- pca_scores.tsv
-- pca_loadings.tsv
-- exploration_manifest.json
-"""
-
-from __future__ import annotations
-
-import argparse
-import json
-import logging
+# MODULES
+# Data science
+import pandas as pd # Arrays
+import numpy as np # Tables
 import math
-from pathlib import Path
 
-import matplotlib
+# ML and data processing
+from sklearn.decomposition import PCA # Principle Component Analysis
+from sklearn.preprocessing import StandardScaler # Data normalization
 
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-import seaborn as sns
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
+# Data visualization
+import matplotlib.pyplot as plt # Typical plotting
+import seaborn as sns # Better plotting
 
-SPECIES_NAMES = ["human", "mouse"]
-DEFAULT_OUTPUT_DIRECTORY = Path("results")
-STALE_PLOT_FILENAMES = [
-    "pca_species_and_loadings.png",
-    "pca_biplot.png",
-    "pca_loadings_weights.png",
-]
+# Others
+from IPython.display import display # To show pandas tables
+import argparse
 
 
-def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments."""
+# ==================================== 
+# INPUT DATA in the CLI
+# ==================================== 
+parser = argparse.ArgumentParser(description="PCA analysis of RNA-seq data")
+parser.add_argument("--input", "-i", type=str, required=True, help="Path to the input TSV file")
+args = parser.parse_args()
 
-    parser = argparse.ArgumentParser(description=__doc__)
 
-    parser.add_argument(
-        "--input",
-        required=True,
-        type=Path,
-        help="Input TSV with paired human and mouse expression columns.",
+# ==================================== 
+# FILE FORMAT  
+# ==================================== 
+# Divide the file in single genes, breaking pairs. 
+# access to the command line input
+df = pd.read_csv(args.input, delimiter="\t")
+
+# 1. Separate the human data
+human_cols = [c for c in df.columns if c.endswith("_human") or c == "gene_name"]
+df_human = df[human_cols].rename(columns=lambda c: c.replace("_tpm_human", "").replace("_id_human", "_id"))
+df_human["species"] = "human"
+
+# 2. Separate the mouse data
+mouse_cols = [c for c in df.columns if c.endswith("_mouse") or c == "gene_name"]
+df_mouse = df[mouse_cols].rename(columns=lambda c: c.replace("_tpm_mouse", "").replace("_id_mouse", "_id"))
+df_mouse["species"] = "mouse"
+
+# 3. Combine them into one long-format DataFrame and rearrange columns
+df_long = pd.concat([df_human, df_mouse], ignore_index=True)
+id_cols = ["gene_id", "gene_name", "species"]
+tissue_cols = [c for c in df_long.columns if c not in id_cols]
+
+df_final = df_long[id_cols + tissue_cols]
+all_genes_df = df_final
+
+
+
+# ==================================== 
+# PCA
+# ==================================== 
+id_cols = ["gene_id", "gene_name", "species"]
+features = [c for c in all_genes_df.columns if c not in id_cols]
+
+# Log-transform, drop NaNs & Standardize
+df_pca_clean = all_genes_df.copy()
+df_pca_clean[features] = np.log2(df_pca_clean[features] + 1)
+df_pca_clean = df_pca_clean.dropna().copy()
+x = StandardScaler().fit_transform(df_pca_clean[features])
+
+# Run PCA
+pca = PCA(n_components=2)
+components = pca.fit_transform(x)
+
+# Extract percentage of variance explained by each PC
+var_explained = pca.explained_variance_ratio_ * 100
+pc1_var = var_explained[0]
+pc2_var = var_explained[1]
+
+pc1_col = f"PC1 ({pc1_var:.2f}%)"
+pc2_col = f"PC2 ({pc2_var:.2f}%)"
+
+pca_res = pd.DataFrame(data=components, columns=[pc1_col, pc2_col])
+for col in all_genes_df.columns:
+    pca_res[col] = df_pca_clean[col].values
+
+
+# ====================================
+# PLOT PCA
+# ====================================
+dot_size = 38
+
+def plot_combined_pca_megaplot(pca_res, tissue_features, pc1_label, pc2_label, n_cols=2):
+    n_panels = len(tissue_features) + 1
+    n_rows = math.ceil(n_panels / n_cols)
+
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(n_cols * 3, n_rows * 2),
+        sharex=True,
+        sharey=True,
+        squeeze=False
     )
 
-    parser.add_argument(
-        "--name",
-        "--dataset-name",
-        dest="dataset_name",
-        default=None,
-        help="Dataset name used for the output folder. Defaults to the input filename stem.",
-    )
-
-    parser.add_argument(
-        "--output-dir",
-        "--outdir",
-        dest="output_dir",
-        default=DEFAULT_OUTPUT_DIRECTORY,
-        type=Path,
-        help="Root output directory.",
-    )
-
-    parser.add_argument(
-        "--expression-unit",
-        default="tpm",
-        help="Expression unit in columns named <tissue>_<expression_unit>_<species>.",
-    )
-
-    parser.add_argument(
-        "--dpi",
-        default=300,
-        type=int,
-        help="Resolution for saved PNG figures.",
-    )
-
-    parser.add_argument(
-        "--no-log-transform",
-        action="store_true",
-        help="Disable log2(x + 1) transformation before principal component analysis.",
-    )
-
-    parser.add_argument(
-        "--loading-arrow-scale",
-        default=3.5,
-        type=float,
-        help="Scale factor for loading arrows in the biplot.",
-    )
-
-    return parser.parse_args()
-
-
-
-
-def get_expression_columns(
-    dataframe: pd.DataFrame,
-    species: str,
-    expression_unit: str,
-) -> list[str]:
-    """Return expression columns for one species."""
-
-    suffix = f"_{expression_unit}_{species}"
-    expression_columns = [
-        column
-        for column in dataframe.columns
-        if column.endswith(suffix)
-    ]
-
-    if not expression_columns:
-        raise ValueError(
-            f"No expression columns found for species={species!r}. "
-            f"Expected columns ending in {suffix!r}."
-        )
-
-    return expression_columns
-
-
-def get_tissue_name(
-    expression_column: str,
-    species: str,
-    expression_unit: str,
-) -> str:
-    """Extract tissue name from an expression column."""
-
-    suffix = f"_{expression_unit}_{species}"
-    return expression_column[: -len(suffix)]
-
-
-def build_species_dataframe(
-    dataframe: pd.DataFrame,
-    species: str,
-    gene_name_column: str,
-    expression_unit: str,
-) -> pd.DataFrame:
-    """Build one gene-level dataframe for one species."""
-
-    gene_id_column = f"gene_id_{species}"
-
-    if gene_id_column not in dataframe.columns:
-        raise ValueError(f"Missing gene identifier column: {gene_id_column}")
-
-    expression_columns = get_expression_columns(
-        dataframe=dataframe,
-        species=species,
-        expression_unit=expression_unit,
-    )
-
-    selected_columns = [gene_id_column, gene_name_column, *expression_columns]
-
-    output_dataframe = dataframe[selected_columns].copy()
-    output_dataframe = output_dataframe.rename(
-        columns={
-            gene_id_column: "gene_id",
-            gene_name_column: "gene_name",
-            **{
-                column: get_tissue_name(
-                    expression_column=column,
-                    species=species,
-                    expression_unit=expression_unit,
-                )
-                for column in expression_columns
-            },
-        }
-    )
-
-    output_dataframe["species"] = species
-
-    return output_dataframe
-
-
-def build_gene_level_dataframe(
-    dataframe: pd.DataFrame,
-    expression_unit: str,
-) -> tuple[pd.DataFrame, list[str]]:
-    """Convert paired ortholog rows into one row per gene."""
-
-    gene_name_column = "gene_name"
-
-    species_dataframes = [
-        build_species_dataframe(
-            dataframe=dataframe,
-            species=species,
-            gene_name_column=gene_name_column,
-            expression_unit=expression_unit,
-        )
-        for species in SPECIES_NAMES
-    ]
-
-    long_dataframe = pd.concat(species_dataframes, ignore_index=True)
-
-    identifier_columns = ["gene_id", "gene_name", "species"]
-    tissue_columns = [
-        column
-        for column in long_dataframe.columns
-        if column not in identifier_columns
-    ]
-
-    long_dataframe = long_dataframe[identifier_columns + tissue_columns].copy()
-
-    if long_dataframe[tissue_columns].isna().any().any():
-        missing_count = int(long_dataframe[tissue_columns].isna().sum().sum())
-        raise ValueError(f"Expression table contains {missing_count} missing expression values.")
-
-    return long_dataframe, tissue_columns
-
-
-def run_principal_component_analysis(
-    gene_level_dataframe: pd.DataFrame,
-    tissue_columns: list[str],
-    use_log_transform: bool,
-) -> tuple[pd.DataFrame, pd.DataFrame, PCA]:
-    """Run two-component principal component analysis."""
-
-    analysis_dataframe = gene_level_dataframe.copy()
-
-    expression_values = analysis_dataframe[tissue_columns].apply(
-        pd.to_numeric,
-        errors="coerce",
-    )
-
-    if expression_values.isna().any().any():
-        missing_count = int(expression_values.isna().sum().sum())
-        raise ValueError(f"Expression table contains {missing_count} non-numeric values.")
-
-    if use_log_transform:
-        if (expression_values < 0).any().any():
-            raise ValueError("Cannot apply log2(x + 1) because negative values were found.")
-
-        expression_values = np.log2(expression_values + 1)
-
-    scaled_values = StandardScaler().fit_transform(expression_values)
-
-    principal_component_analysis = PCA(n_components=2)
-    components = principal_component_analysis.fit_transform(scaled_values)
-
-    variance_explained = principal_component_analysis.explained_variance_ratio_ * 100
-    first_component_label = f"PC1 ({variance_explained[0]:.2f}%)"
-    second_component_label = f"PC2 ({variance_explained[1]:.2f}%)"
-
-    scores_dataframe = pd.DataFrame(
-        data=components,
-        columns=[first_component_label, second_component_label],
-    )
-
-    for column in gene_level_dataframe.columns:
-        scores_dataframe[column] = gene_level_dataframe[column].values
-
-    loadings_dataframe = pd.DataFrame(
-        data=principal_component_analysis.components_.T,
-        columns=[first_component_label, second_component_label],
-        index=tissue_columns,
-    )
-
-    loadings_dataframe.index.name = "tissue"
-    loadings_dataframe = loadings_dataframe.reset_index()
-
-    return scores_dataframe, loadings_dataframe, principal_component_analysis
-
-
-def set_plot_style() -> None:
-    """Set common figure typography without grid lines."""
-
-    sns.set_theme(
-        style="white",
-        rc={
-            "axes.grid": False,
-            "grid.alpha": 0.0,
-        },
-    )
-
-    plt.rcParams.update(
-        {
-            "axes.grid": False,
-            "axes.labelsize": 14,
-            "axes.titlesize": 15,
-            "xtick.labelsize": 12,
-            "ytick.labelsize": 12,
-            "legend.fontsize": 11,
-            "pdf.fonttype": 42,
-            "ps.fonttype": 42,
-        }
-    )
-
-
-def _plot_species_pca(
-    scores_dataframe: pd.DataFrame,
-    axis: plt.Axes,
-    first_component_label: str,
-    second_component_label: str,
-    title: str,
-) -> None:
-    """Draw a species-colored principal component analysis scatter plot."""
+    axes = axes.flatten()
 
     sns.scatterplot(
-        data=scores_dataframe,
-        x=first_component_label,
-        y=second_component_label,
+        data=pca_res,
+        x=pc1_label,
+        y=pc2_label,
         hue="species",
-        palette="viridis",
+        palette="Set1",
         alpha=0.8,
         edgecolor="white",
-        linewidth=0.5,
-        ax=axis,
+        linewidth=0.3,
+        s=dot_size,
+        legend=False,
+        ax=axes[0]
     )
 
-    axis.set_title(title)
-    axis.set_xlabel(first_component_label)
-    axis.set_ylabel(second_component_label)
-    axis.legend(title="Species")
-    axis.grid(visible=False)
-    sns.despine(ax=axis)
+    axes[0].set_title("species", fontsize=14)
+    axes[0].set_xlabel("")
+    axes[0].set_ylabel("")
+    axes[0].tick_params(labelsize=14)
 
+    vmin = pca_res[tissue_features].min().min()
+    vmax = pca_res[tissue_features].max().max()
+    norm = plt.Normalize(vmin=vmin, vmax=vmax)
 
-def plot_species_and_arrows_grid(
-    scores_dataframe: pd.DataFrame,
-    loadings_dataframe: pd.DataFrame,
-    output_path: Path,
-    dpi: int,
-    loading_arrow_scale: float,
-) -> None:
-    """Plot species-colored PCA alone and with tissue loading arrows."""
+    for i, color_var in enumerate(tissue_features, start=1):
+        ax = axes[i]
 
-    first_component_label, second_component_label = list(scores_dataframe.columns[:2])
-
-    figure, axes = plt.subplots(
-        nrows=1,
-        ncols=2,
-        figsize=(11, 4.5),
-    )
-
-    _plot_species_pca(
-        scores_dataframe=scores_dataframe,
-        axis=axes[0],
-        first_component_label=first_component_label,
-        second_component_label=second_component_label,
-        title="PCA colored by species",
-    )
-
-    _plot_species_pca(
-        scores_dataframe=scores_dataframe,
-        axis=axes[1],
-        first_component_label=first_component_label,
-        second_component_label=second_component_label,
-        title="PCA colored by species with tissue loadings",
-    )
-
-    for _, loading_row in loadings_dataframe.iterrows():
-        x_arrow = loading_row[first_component_label] * loading_arrow_scale
-        y_arrow = loading_row[second_component_label] * loading_arrow_scale
-
-        axes[1].arrow(
-            0,
-            0,
-            x_arrow,
-            y_arrow,
-            color="black",
-            alpha=0.9,
-            head_width=0.15,
-            linewidth=1.5,
-            length_includes_head=True,
-        )
-
-        axes[1].text(
-            x_arrow * 1.15,
-            y_arrow * 1.15,
-            loading_row["tissue"],
-            color="black",
-            fontweight="bold",
-            fontsize=10,
-            ha="center",
-            va="center",
-        )
-
-    axes[1].axvline(0, color="black", linestyle="--", linewidth=0.5, alpha=0.5)
-    axes[1].axhline(0, color="black", linestyle="--", linewidth=0.5, alpha=0.5)
-    axes[1].grid(visible=False)
-    sns.despine(ax=axes[1])
-
-    figure.tight_layout()
-    figure.savefig(output_path, dpi=dpi, bbox_inches="tight")
-    plt.close(figure)
-
-
-def plot_tissue_principal_component_grid(
-    scores_dataframe: pd.DataFrame,
-    tissue_columns: list[str],
-    output_path: Path,
-    dpi: int,
-    number_of_columns: int = 2,
-) -> None:
-    """Plot principal component analysis colored by each tissue."""
-
-    component_columns = list(scores_dataframe.columns[:2])
-    first_component_label, second_component_label = component_columns
-
-    number_of_features = len(tissue_columns)
-    number_of_rows = math.ceil(number_of_features / number_of_columns)
-
-    figure, axes = plt.subplots(
-        number_of_rows,
-        number_of_columns,
-        figsize=(number_of_columns * 5.5, number_of_rows * 4),
-        squeeze=False,
-    )
-
-    flattened_axes = axes.flatten()
-
-    for index, tissue_column in enumerate(tissue_columns):
-        axis = flattened_axes[index]
-
-        scatter = axis.scatter(
-            scores_dataframe[first_component_label],
-            scores_dataframe[second_component_label],
-            c=scores_dataframe[tissue_column],
+        sc = ax.scatter(
+            pca_res[pc1_label],
+            pca_res[pc2_label],
+            c=pca_res[color_var],
             cmap="viridis",
+            norm=norm,
             alpha=0.8,
             edgecolors="white",
-            linewidth=0.3,
+            linewidth=0.2,
+            s=dot_size
         )
 
-        colorbar = figure.colorbar(scatter, ax=axis)
-        colorbar.set_label(f"expression value in {tissue_column}", fontsize=12)
-        colorbar.ax.tick_params(labelsize=10)
+        ax.set_title(color_var, fontsize=14)
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+        ax.tick_params(labelsize=14)
 
-        axis.set_xlabel(first_component_label)
-        axis.set_ylabel(second_component_label)
-        axis.set_title(f"PCA colored by {tissue_column}")
-        axis.grid(visible=False)
-        sns.despine(ax=axis)
+    for j in range(n_panels, len(axes)):
+        fig.delaxes(axes[j])
 
-    for empty_axis in flattened_axes[number_of_features:]:
-        figure.delaxes(empty_axis)
+    fig.suptitle("PCA colored by species and tissue expression", fontsize=18)
+    fig.supxlabel(pc1_label, fontsize=14)
+    fig.supylabel(pc2_label, fontsize=14)
 
-    figure.tight_layout()
-    figure.savefig(output_path, dpi=dpi, bbox_inches="tight")
-    plt.close(figure)
-
-
-
-def remove_stale_plot_outputs(output_directory: Path) -> None:
-    """Remove old plot names that can make reruns look unchanged."""
-
-    for filename in STALE_PLOT_FILENAMES:
-        stale_path = output_directory / filename
-        if stale_path.exists():
-            stale_path.unlink()
-
-
-def write_manifest(
-    output_path: Path,
-    args: argparse.Namespace,
-    output_directory: Path,
-    gene_level_dataframe: pd.DataFrame,
-    tissue_columns: list[str],
-    scores_dataframe: pd.DataFrame,
-) -> None:
-    """Write a reproducibility manifest."""
-
-    manifest = {
-        "script_version": SCRIPT_VERSION,
-        "input": str(args.input),
-        "dataset_name": args.dataset_name,
-        "output_directory": str(output_directory),
-        "expression_unit": args.expression_unit,
-        "log2_x_plus_1_transform": not args.no_log_transform,
-        "n_input_rows": int(len(gene_level_dataframe) // len(SPECIES_NAMES)),
-        "n_gene_rows_after_species_split": int(len(gene_level_dataframe)),
-        "n_tissues": int(len(tissue_columns)),
-        "tissues": tissue_columns,
-        "principal_component_columns": list(scores_dataframe.columns[:2]),
-        "outputs": {
-            "pca_scores": "pca_scores.tsv",
-            "pca_loadings": "pca_loadings.tsv",
-            "tissue_grid_plot": "pca_by_tissue.png",
-            "species_and_arrows_plot": "pca_species_and_arrows.png",
-        },
-    }
-
-    output_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-
-
-def main() -> Path:
-    """Run data exploration."""
-
-    configure_logging()
-    set_plot_style()
-
-    args = parse_args()
-
-    if args.dataset_name is None:
-        args.dataset_name = args.input.stem
-
-    output_directory = args.output_dir / args.dataset_name / "Data_Exploration"
-    output_directory.mkdir(parents=True, exist_ok=True)
-    remove_stale_plot_outputs(output_directory)
-
-    LOGGER.info("Loading input dataset: %s", args.input)
-    input_dataframe = pd.read_csv(args.input, sep="\t")
-
-    LOGGER.info("Building one-row-per-gene expression table.")
-    gene_level_dataframe, tissue_columns = build_gene_level_dataframe(
-        dataframe=input_dataframe,
-        expression_unit=args.expression_unit,
+    fig.subplots_adjust(
+        left=0.17,
+        right=0.82,
+        bottom=0.12,
+        top=0.88,
+        wspace=0.12,
+        hspace=0.35
     )
 
-    gene_level_dataframe.to_csv(
-        output_directory / "gene_level_expression.tsv",
-        sep="\t",
-        index=False,
+    cbar_ax = fig.add_axes([0.90, 0.18, 0.025, 0.65])
+    cbar = fig.colorbar(sc, cax=cbar_ax)
+    cbar.set_label("Expression", fontsize=14, labelpad=10)
+    cbar.ax.tick_params(labelsize=14)
+
+    plt.savefig("PCA_combined_megaplot.png", dpi=300)
+    plt.show()
+
+
+plot_combined_pca_megaplot(pca_res, features, pc1_col, pc2_col, n_cols=2)
+
+# Save results (TSV and plot)
+pca_res.to_csv("PCA_results.tsv", sep="\t", index=False)
+
+
+
+# ====================================
+# PCA LOADINGS
+# ====================================
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+
+# ====================================================== #
+# PCA BIPLOT (GENE EXPRESSION SPACE WITH TISSUE VECTORS) #
+# ====================================================== #
+
+dot_size = 38
+
+pc1_label = pca_res.columns[0]
+pc2_label = pca_res.columns[1]
+
+loadings = pd.DataFrame(
+    pca.components_.T,
+    columns=[pc1_label, pc2_label],
+    index=features
+)
+
+print("PCA Loadings (weights per tissue):")
+display(loadings)
+
+fig, ax = plt.subplots(figsize=(4.4, 3.6))
+
+# Gene points without species coloring
+ax.scatter(
+    pca_res[pc1_label],
+    pca_res[pc2_label],
+    alpha=0.3,
+    edgecolors="white",
+    linewidth=0.3,
+    color="gray",
+    s=dot_size
+)
+
+scale_factor = 3.5
+colors = plt.cm.Set1(np.linspace(0, 1, len(loadings.index)))
+colors = ["orange", "magenta", "green", "blue", "red",]
+
+legend_handles = []
+
+for color, tissue in zip(colors, loadings.index):
+    x_arrow = loadings.loc[tissue, pc1_label] * scale_factor
+    y_arrow = loadings.loc[tissue, pc2_label] * scale_factor
+
+    ax.arrow(
+        0,
+        0,
+        x_arrow,
+        y_arrow,
+        color=color,
+        alpha=1,
+        head_width=0.12,
+        linewidth=2.5,
+        length_includes_head=True
     )
 
-    LOGGER.info("Running principal component analysis with %d tissues.", len(tissue_columns))
-    scores_dataframe, loadings_dataframe, _ = run_principal_component_analysis(
-        gene_level_dataframe=gene_level_dataframe,
-        tissue_columns=tissue_columns,
-        use_log_transform=not args.no_log_transform,
+    legend_handles.append(
+        Line2D([0], [0], color=color, lw=2, label=tissue)
     )
 
-    scores_dataframe.to_csv(
-        output_directory / "pca_scores.tsv",
-        sep="\t",
-        index=False,
-    )
+ax.set_title("PCA biplot", fontsize=14)
+ax.set_xlabel(pc1_label, fontsize=12)
+ax.set_ylabel(pc2_label, fontsize=12)
+ax.tick_params(labelsize=11)
 
-    loadings_dataframe.to_csv(
-        output_directory / "pca_loadings.tsv",
-        sep="\t",
-        index=False,
-    )
+ax.axvline(0, color="black", linestyle="--", linewidth=0.5, alpha=0.5)
+ax.axhline(0, color="black", linestyle="--", linewidth=0.5, alpha=0.5)
 
-    LOGGER.info("Saving tissue-colored principal component grid.")
-    plot_tissue_principal_component_grid(
-        scores_dataframe=scores_dataframe,
-        tissue_columns=tissue_columns,
-        output_path=output_directory / "pca_by_tissue.png",
-        dpi=args.dpi,
-    )
+ax.legend(
+    handles=legend_handles,
+    title="Tissue",
+    fontsize=10,
+    title_fontsize=10,
+    loc="best",
+    frameon=True,
+)
 
-    LOGGER.info("Saving species-colored principal component grid with loading arrows.")
-    plot_species_and_arrows_grid(
-        scores_dataframe=scores_dataframe,
-        loadings_dataframe=loadings_dataframe,
-        output_path=output_directory / "pca_species_and_arrows.png",
-        dpi=args.dpi,
-        loading_arrow_scale=args.loading_arrow_scale,
-    )
-
-    write_manifest(
-        output_path=output_directory / "exploration_manifest.json",
-        args=args,
-        output_directory=output_directory,
-        gene_level_dataframe=gene_level_dataframe,
-        tissue_columns=tissue_columns,
-        scores_dataframe=scores_dataframe,
-    )
-
-    LOGGER.info("Data exploration outputs saved to %s", output_directory)
-
-    return output_directory
+plt.tight_layout()
+plt.savefig("PCA_biplot.png", dpi=300)
+plt.show()
 
 
-if __name__ == "__main__":
-    main()
+
+# ====================================
+# FEATURE DISTRIBUTIONS
+# ====================================
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from matplotlib.lines import Line2D
+
+# EXPRESSION DISTRIBUTION BY TISSUE AND SPECIES         
+id_cols = ["gene_id", "gene_name", "species"]
+tissue_features = [c for c in all_genes_df.columns if c not in id_cols]
+
+plot_df = all_genes_df.melt(
+    id_vars=id_cols,
+    value_vars=tissue_features,
+    var_name="tissue",
+    value_name="expression"
+)
+
+species_colors = {
+    "human": "blue",
+    "mouse": "red"
+}
+
+hue_order = ["human", "mouse"]
+
+fig, ax = plt.subplots(figsize=(5.6, 3.9))
+
+sns.violinplot(
+    data=plot_df,
+    x="tissue",
+    y="expression",
+    hue="species",
+    order=tissue_features,
+    hue_order=hue_order,
+    palette=species_colors,
+    split=True,
+    inner=None,
+    linewidth=1.1,
+    edgecolor="black",
+    alpha=0.9,
+    ax=ax
+)
+
+# MARK MEAN OF EACH DISTRIBUTION                         
+
+mean_df = (
+    plot_df
+    .groupby(["tissue", "species"], as_index=False)["expression"]
+    .mean()
+)
+
+species_offsets = {
+    "human": -0.18,
+    "mouse": 0.18
+}
+
+mean_line_half_width = 0.11
+
+for tissue_index, tissue in enumerate(tissue_features):
+    for species in hue_order:
+        mean_value = mean_df.loc[
+            (mean_df["tissue"] == tissue) &
+            (mean_df["species"] == species),
+            "expression"
+        ]
+
+        if mean_value.empty:
+            continue
+
+        x_center = tissue_index + species_offsets[species]
+
+       
+        # White mean line
+        ax.hlines(
+            y=mean_value.iloc[0],
+            xmin=x_center - mean_line_half_width,
+            xmax=x_center + mean_line_half_width,
+            color="white",
+            linewidth=1,
+            edgecolor="black",
+            zorder=11
+        )
+
+# FORMAT                                                
+ax.set_title("Expression distribution by tissue and species", fontsize=18)
+ax.set_xlabel("Tissue", fontsize=14)
+ax.set_ylabel("Expression value", fontsize=14)
+
+ax.tick_params(axis="x", labelsize=14, rotation=25)
+ax.tick_params(axis="y", labelsize=14)
+
+ax.grid(True, which="major", axis="y", linestyle="--", linewidth=0.5, alpha=0.7)
+ax.grid(True, which="major", axis="x", linestyle="--", linewidth=0.5, alpha=0.7)
+
+for spine in ax.spines.values():
+    spine.set_visible(True)
+
+legend_handles = [
+    Line2D([], [], linestyle="None", label="human"),
+    Line2D([], [], linestyle="None", label="mouse")
+]
+
+legend = ax.legend(
+    handles=legend_handles,
+    title="Species",
+    fontsize=12,
+    title_fontsize=12,
+    loc="best",
+    frameon=False,
+    handlelength=0,
+    handletextpad=0
+)
+
+for text, color in zip(legend.get_texts(), [species_colors["human"], species_colors["mouse"]]):
+    text.set_color(color)
+
+plt.tight_layout()
+plt.savefig("expression_distribution_by_tissue_species.png", dpi=300)
+plt.show()

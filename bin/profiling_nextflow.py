@@ -116,6 +116,19 @@ def stage_outputs_for_nextflow(dataset_name: str) -> None:
     copy_directory_contents(dataset_dir / "Expression_vs_Sequence", Path("Expression_vs_Sequence"))
     copy_directory_contents(dataset_dir / "Profiling", Path("Profiling"))
 
+def metric_column_to_method_name(metric_column: str) -> str:
+    """Convert selected metric dataframe column into CLI method name."""
+
+    internal_metric_names = {
+        function.__name__
+        for function in pf.INTERNAL_METRICS
+    }
+
+    for metric_name in internal_metric_names:
+        if metric_column == f"{metric_name}_sim":
+            return metric_name
+
+    return metric_column
 
 # -----------------------------
 # Main
@@ -188,12 +201,15 @@ def main() -> str:
         output_dir=OUTPUT_DIR,
     )
 
-    best_metric = pf.best_method(
-        df_ortho=ortholog_metrics,
-        df_nonortho=nonortholog_metrics,
-    )
+    best_metric_column = pf.best_method(
+    df_ortho=ortholog_metrics,
+    df_nonortho=nonortholog_metrics,
+)
 
-    logger.info("Best profiling metric: %s", best_metric)
+    best_metric = metric_column_to_method_name(best_metric_column)
+
+    logger.info("Best profiling metric column: %s", best_metric_column)
+    logger.info("Best profiling method: %s", best_metric)
 
     # -----------------------------
     # Stable profiling summary outputs

@@ -223,6 +223,23 @@ def write_manifest(
     output_path.write_text(json.dumps(manifest, indent=2) + "")
 
 
+def resolve_metric_column(metric_name: str, dataframes: list[pd.DataFrame]) -> str:
+    candidate_columns = [metric_name]
+
+    if not metric_name.endswith("_sim"):
+        candidate_columns.append(f"{metric_name}_sim")
+
+    for candidate_column in candidate_columns:
+        if all(candidate_column in dataframe.columns for dataframe in dataframes):
+            return candidate_column
+
+    available_columns = sorted(set().union(*(set(dataframe.columns) for dataframe in dataframes)))
+    raise ValueError(
+        f"Could not resolve metric column for '{metric_name}'. "
+        f"Tried {candidate_columns}. Available columns: {available_columns}"
+    )
+
+
 def main(cli_args: list[str] | None = None) -> Path:
     """Run training and evaluation workflow."""
 
@@ -248,6 +265,8 @@ def main(cli_args: list[str] | None = None) -> Path:
 
     logger.info("Starting model training.")
 
+    metric_column = resolve_metric_column(args.metric, [df_train, df_val, df_test])
+
     model = run_training(
         df_train=df_train,
         df_val=df_val,
@@ -268,7 +287,7 @@ def main(cli_args: list[str] | None = None) -> Path:
         optuna_trials=args.optuna_trials,
         optuna_jobs=args.optuna_jobs,
         optuna_epochs=args.optuna_epochs,
-        metric_column=args.metric,
+        metric_column=metric_column,
     )
 
     logger.info("Training completed.")
@@ -288,12 +307,12 @@ def main(cli_args: list[str] | None = None) -> Path:
     evaluation_dataframe = build_evaluation_dataframe(
         prediction_dataframe=prediction_dataframe,
         test_dataframe=df_test,
-        metric_column=args.metric,
+        metric_column=metric_column,
     )
 
     plot_embedding_vs_expression(
         df=evaluation_dataframe,
-        metric=args.metric,
+        metric=metric_column,
         output_path=model_dir / "evaluation_plot.png",
     )
 
