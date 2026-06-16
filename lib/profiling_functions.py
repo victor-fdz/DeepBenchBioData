@@ -19,9 +19,9 @@ logger = logging.getLogger(__name__)
 # from the absolute difference between species scores.         #
 # ============================================================ #
 
-def net(vector: np.ndarray) -> float:
-    """Number of expressed tissues (TPM > 1)."""
-    return float((vector > 1).sum())
+# def net(vector: np.ndarray) -> float:
+#     """Number of expressed tissues (TPM > 1)."""
+#     return float((vector > 1).sum())
 
 
 def tau(vector: np.ndarray) -> float:
@@ -218,7 +218,7 @@ def z_score_cosine_sim(df: pd.DataFrame, tissues: list[str]) -> pd.DataFrame:
     return df
 
 # Canonical ordered method lists
-INTERNAL_METRICS = [net, shannon, tau, gini]
+INTERNAL_METRICS = [shannon, tau, gini]
 EXTERNAL_METRICS = [met, ssd, cosine_sim, z_score_cosine_sim]
 ALL_METRICS      = INTERNAL_METRICS + EXTERNAL_METRICS
 
