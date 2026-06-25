@@ -19,7 +19,6 @@ import matplotlib.pyplot as plt # Typical plotting
 import seaborn as sns # Better plotting
 
 # Others
-from IPython.display import display # To show pandas tables
 import argparse
 
 
@@ -229,8 +228,6 @@ loadings = pd.DataFrame(
     index=features
 )
 
-print("PCA Loadings (weights per tissue):")
-display(loadings)
 
 fig, ax = plt.subplots(figsize=(4.4, 3.6))
 
