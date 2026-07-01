@@ -1,0 +1,23 @@
+name: environment_tfm
+channels:
+  - conda-forge
+  - pytorch
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+    - torch==2.11.0
+    - transformers==5.8.0
+    - datasets==4.8.5
+    - accelerate==1.13.0
+    - scikit-learn==1.8.0
+    - scanpy==1.11.5
+    - pandas==2.3.3
+    - polars==1.40.1
+    - biopython==1.87
+    - bcbio-gff==0.7.1
+    - pydeseq2==0.5.4
+    - optuna==4.8.0
+    - tensorboard==2.20.0
+    - tqdm==4.67.3
