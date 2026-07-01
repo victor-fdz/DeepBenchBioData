@@ -36,20 +36,34 @@ def main():
     # Calculate means
     positive_means = positive_pairs.mean(numeric_only=True)
     negative_means = negative_pairs.mean(numeric_only=True)
-
-    # Compute metric
+ 
+    # Compute differences
     diff = positive_means - negative_means
+
+    # Promoter identity
     diff_val = float(diff["promoter_identity"])
     max_diff = 75
     diff_percentage = (diff_val / max_diff) * 100
 
+    # Aligment score identity
+    diff_val_score = float(diff["alignment_score"])
+    max_diff = 1000 # minimum -500 (all missmatches) and maximum 500 (all matches) for the alignment score
+    diff_percentage_score = (diff_val_score / max_diff) * 100
+
+
     # Save results
     with open(args.output, "w") as f:
         f.write(
-            f"""Positive pairs mean promoter identity: {positive_means['promoter_identity']:.2f}\n
+ 
+f"""Positive pairs mean promoter identity: {positive_means['promoter_identity']:.2f}\n
 Negative pairs mean promoter identity: {negative_means['promoter_identity']:.2f}\n
-Alignment-based identity difference by functional categories: {diff_percentage:.2f}%\n"""
-        )
+Alignment-based identity difference by functional categories: {diff_percentage:.2f}%\n
+
+Positive pairs mean alignment score: {positive_means['alignment_score']:.2f}\n
+Negative pairs mean alignment score: {negative_means['alignment_score']:.2f}\n
+Alignment score difference by functional categories: {diff_percentage_score:.2f}%\n
+"""
+               )
 
 
 if __name__ == "__main__":

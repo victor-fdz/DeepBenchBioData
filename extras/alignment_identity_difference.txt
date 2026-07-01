@@ -1,0 +1,13 @@
+Positive pairs mean promoter identity: 48.53
+
+Negative pairs mean promoter identity: 48.55
+
+Alignment-based identity difference by functional categories: -0.03%
+
+
+Positive pairs mean alignment score: -26.26
+
+Negative pairs mean alignment score: -25.80
+
+Alignment score difference by functional categories: -0.05%
+
