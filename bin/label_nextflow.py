@@ -389,7 +389,7 @@ def main() -> Path:
     lbl.sanity_check_boxplot(
         df=labeled_dataframe,
         profiling_method=args.profiling,
-        output_path=labeling_dir / f"boxplot_{output_name}.png",
+        output_path=labeling_dir / f"boxplot_{output_name}.svg",
     )
 
     manifest = {

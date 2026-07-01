@@ -145,9 +145,9 @@ def create_nextflow_output_aliases(normalization_dir: Path) -> None:
     """
 
     alias_pairs = {
-        "Orthologs_scatter.png": "orthologs_scatter.png",
-        "NonOrthologs_scatter.png": "nonorthologs_scatter.png",
-        "Increment_PearsonR_heatmap.png": "increment_pearson_heatmap.png",
+        "Orthologs_scatter.svg": "orthologs_scatter.svg",
+        "NonOrthologs_scatter.svg": "nonorthologs_scatter.svg",
+        "Increment_PearsonR_heatmap.svg": "increment_pearson_heatmap.svg",
     }
 
     for source_name, alias_name in alias_pairs.items():
@@ -300,7 +300,7 @@ def main() -> str:
         stats_all,
         args.dataset_name,
         sorted_methods,
-        "Spearman_rho",
+        "Pearson_R",
         "Increment",
         OUTPUT_DIR,
     )

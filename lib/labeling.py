@@ -102,44 +102,6 @@ def random_labeling(
     output_name = f"{profiling_method}_random_labeling_{n_pos}_{n_neg}.tsv"
     return df_out, output_name
 
-
-def rank_labeling_random(
-    df: pd.DataFrame,
-    profiling_method: str,
-    n_pos: int,
-    n_neg: int,
-    random_state: int,
-) -> tuple[pd.DataFrame, str]:
-    """Randomly sample positives from the top-ranked pool and negatives from the bottom-ranked pool."""
-
-    metric_column = get_metric_column(profiling_method)
-    validate_labeling_request(df, metric_column, n_pos, n_neg)
-
-    df_out = df.sort_values(metric_column, ascending=False).reset_index(drop=True).copy()
-    df_out["label"] = "U"
-
-    positive_pool = df_out.head(n_pos)
-    negative_pool = df_out.tail(n_neg)
-
-    positive_indices = positive_pool.sample(
-        n=n_pos,
-        random_state=random_state,
-        replace=False,
-    ).index
-
-    negative_indices = negative_pool.sample(
-        n=n_neg,
-        random_state=random_state + 1,
-        replace=False,
-    ).index
-
-    df_out.loc[positive_indices, "label"] = "P"
-    df_out.loc[negative_indices, "label"] = "N"
-
-    output_name = f"{profiling_method}_rank_labeling_random_{n_pos}_{n_neg}.tsv"
-    return df_out, output_name
-
-
 def sanity_check_boxplot(
     df: pd.DataFrame,
     profiling_method: str,
@@ -161,18 +123,45 @@ def sanity_check_boxplot(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    plt.figure(figsize=(8, 6))
-    sns.boxplot(x="label", y=metric_column, data=df)
-    plt.title(f"{metric_column} by label")
-    plt.xlabel("Label")
-    plt.ylabel(metric_column)
+    plot_df = df[df["label"].isin(["P", "N", "U"])].copy()
+
+    label_order = ["P", "N", "U"]
+    label_palette = {
+        "P": "green",
+        "N": "red",
+        "U": "blue",
+    }
+
+    plt.figure(figsize=(3.4, 3.0))
+
+    ax = sns.boxplot(
+        data=plot_df,
+        x="label",
+        y=metric_column,
+        order=label_order,
+        palette=label_palette,
+        width=0.55,
+        linewidth=1.2,
+        fliersize=1.5,
+    )
+
+    ax.set_xlabel("Pair label", fontsize=11)
+    ax.set_ylabel(metric_column, fontsize=11)
+    ax.set_title(f"{metric_column} by label", fontsize=12)
+
+    ax.set_xticklabels(["Positive", "Negative", "Undefined"], fontsize=10)
+    ax.tick_params(axis="y", labelsize=10)
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
     plt.tight_layout()
-    plt.savefig(output_path, dpi=300)
+    plt.savefig(output_path, format="svg", dpi=300, bbox_inches="tight")
     plt.close()
+
 
 
 LABELING_FUNCTIONS = [
     rank_labeling,
-    random_labeling,
-    rank_labeling_random,
+    random_labeling
 ]

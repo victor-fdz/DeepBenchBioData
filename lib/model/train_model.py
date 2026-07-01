@@ -10,10 +10,12 @@ import sys
 from pathlib import Path
 from typing import Any
 import copy
+import random
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 import numpy as np
 import optuna
 import pandas as pd
@@ -23,6 +25,7 @@ from scipy.stats import kendalltau
 from scipy.stats import pearsonr
 from scipy.stats import spearmanr
 from torch.utils.data import DataLoader
+from scipy.stats import ttest_ind
 
 from lib.model.datasets import DNAPairDatasetWithMeta
 from lib.model.loss_function import ContrastiveLossCosine
@@ -145,6 +148,17 @@ def _prepare_binary_labels_for_stratification(df_train: pd.DataFrame) -> pd.Seri
 
     return labels_for_stratification
 
+def set_reproducibility_seed(seed: int) -> None:
+    """Reset random states before final training."""
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception:
+        pass
 
 # -----------------------------
 # Diagnostics
@@ -210,6 +224,7 @@ def train_model(
     summary_path: Path,
     training_summary: str,
     diagnostics_path: Path | None = None,
+    loss_path: Path | None = None,
     early_stopping_patience: int = 20,
     early_stopping_min_delta: float = 0.0,
 ) -> torch.nn.Module:
@@ -230,6 +245,7 @@ def train_model(
     logger.info("Starting model training (%d epochs).", num_epochs)
 
     diagnostic_rows = []
+    loss_rows = []
 
     best_validation_loss = float("inf")
     best_epoch = 0
@@ -281,6 +297,14 @@ def train_model(
                 epoch,
                 avg_train_loss,
                 avg_val_loss,
+            )
+
+            loss_rows.append(
+                {
+                    "epoch": epoch,
+                    "train_loss": float(avg_train_loss),
+                    "validation_loss": float(avg_val_loss),
+                }
             )
 
             improved = avg_val_loss < (
@@ -346,6 +370,15 @@ def train_model(
         )
 
         logger.info("Epoch embedding distances saved to %s", diagnostics_path)
+
+    if loss_path is not None:
+        pd.DataFrame(loss_rows).to_csv(
+            loss_path,
+            sep="\t",
+            index=False,
+        )
+
+        logger.info("Training loss history saved to %s", loss_path)
 
     logger.info(
         "Model weights saved to %s. Restored best epoch=%d | best val=%.6f",
@@ -483,6 +516,7 @@ def optimize_hyperparameters(
         final_train_loss = np.nan
         final_validation_loss = np.nan
         best_validation_loss = np.inf
+        epochs_without_improvement = 0
 
         for epoch in range(1, trial_epochs + 1):
             model.train()
@@ -523,7 +557,6 @@ def optimize_hyperparameters(
 
             final_train_loss = mean_train_loss
             final_validation_loss = mean_validation_loss
-            best_validation_loss = min(best_validation_loss, mean_validation_loss)
 
             optuna_epoch_loss_rows.append(
                 {
@@ -553,12 +586,31 @@ def optimize_hyperparameters(
                 mean_validation_loss,
             )
 
+            improved = mean_validation_loss < (
+                best_validation_loss - DEFAULT_EARLY_STOPPING_MIN_DELTA
+            )
+
+            if improved:
+                best_validation_loss = mean_validation_loss
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+
+            if epochs_without_improvement >= DEFAULT_EARLY_STOPPING_PATIENCE:
+                logger.info(
+                    "Optuna trial %d early stopping at epoch %d | best val=%.6f",
+                    trial.number,
+                    epoch,
+                    best_validation_loss,
+                )
+                break
+
         trial.set_user_attr("final_train_loss", float(final_train_loss))
         trial.set_user_attr("final_validation_loss", float(final_validation_loss))
         trial.set_user_attr("best_validation_loss", float(best_validation_loss))
         trial.set_user_attr("trial_seed", int(trial_seed))
 
-        return float(final_validation_loss)
+        return float(best_validation_loss)
 
     study = optuna.create_study(
         direction="minimize",
@@ -599,43 +651,29 @@ def optimize_hyperparameters(
     return study.best_params
 
 
-
-# ============================= 
-# Pre-training analyses
-# =============================
-def save_untrained_test_embedding_distances(
+# -----------------------------
+# Plots
+# -----------------------------
+def save_embedding_distance_distribution_from_model(
     model: torch.nn.Module,
-    df_test: pd.DataFrame,
-    batch_size: int,
-    output_path: Path,
+    loader: DataLoader,
+    source_dataframe: pd.DataFrame,
+    output_table_path: Path,
 ) -> pd.DataFrame:
-    """Embed test pairs with an untrained model and summarize distances by label."""
-
-    test_loader = DataLoader(
-        DNAPairDatasetWithMeta(df_test),
-        batch_size=batch_size,
-        shuffle=False,
-    )
-
-    _validate_loader_not_empty(test_loader, "Untrained test sanity check")
+    """Save pair embedding distances from a model and dataloader."""
 
     model.eval()
-
     rows = []
 
     with torch.no_grad():
-        for seq1, seq2, labels, pair_row_id, gene_id_1, gene_id_2 in test_loader:
+        for seq1, seq2, labels, pair_row_id, gene_id_1, gene_id_2 in loader:
             output1, output2 = model(seq1, seq2)
+            embedding_distance = 1.0 - F.cosine_similarity(output1, output2)
 
-            embedding_distance = (
-                1.0 - F.cosine_similarity(output1, output2)
-            ).cpu().numpy()
-
-            for row_id, first_gene, second_gene, label, distance in zip(
+            for row_id, first_gene, second_gene, distance in zip(
                 pair_row_id,
                 gene_id_1,
                 gene_id_2,
-                labels,
                 embedding_distance,
             ):
                 rows.append(
@@ -643,19 +681,19 @@ def save_untrained_test_embedding_distances(
                         "pair_row_id": int(row_id),
                         "gene_id_1": first_gene,
                         "gene_id_2": second_gene,
-                        "label": int(label.item()),
-                        "embedding_distance": float(distance),
+                        "embedding_distance": float(distance.item()),
                     }
                 )
 
     distance_dataframe = pd.DataFrame(rows)
 
     metadata_columns = ["pair_row_id"]
-
-    if "original_label" in df_test.columns:
+    if "original_label" in source_dataframe.columns:
         metadata_columns.append("original_label")
+    elif "label" in source_dataframe.columns:
+        metadata_columns.append("label")
 
-    metadata_dataframe = df_test[metadata_columns].copy()
+    metadata_dataframe = source_dataframe[metadata_columns].copy()
 
     distance_dataframe = distance_dataframe.merge(
         metadata_dataframe,
@@ -663,65 +701,257 @@ def save_untrained_test_embedding_distances(
         how="left",
     )
 
-    if "original_label" in distance_dataframe.columns:
-        group_column = "original_label"
-    else:
-        group_column = "label"
+    if len(distance_dataframe) != len(rows):
+        raise ValueError("Embedding distance metadata merge changed the number of rows.")
 
-    summary_dataframe = (
-        distance_dataframe
-        .groupby(group_column, dropna=False)["embedding_distance"]
-        .agg(["mean", "std", "count"])
-        .reset_index()
-        .rename(
-            columns={
-                group_column: "label_group",
-                "mean": "mean_embedding_distance",
-                "std": "std_embedding_distance",
-                "count": "n_pairs",
-            }
-        )
+    output_table_path.parent.mkdir(parents=True, exist_ok=True)
+    distance_dataframe.to_csv(output_table_path, sep="\t", index=False)
+
+
+    logger.info("Embedding distance distribution table saved to %s", output_table_path)
+
+    return distance_dataframe
+
+def plot_trained_embedding_distance_scatter(
+    trained_dataframe: pd.DataFrame,
+    output_plot_path: Path,
+    output_stats_path: Path,
+) -> None:
+    """Plot trained-model embedding distances for positive and negative test pairs."""
+
+    dataframe = trained_dataframe.copy()
+
+    label_column = "original_label" if "original_label" in dataframe.columns else "label"
+
+    dataframe["label_normalized"] = dataframe[label_column].replace(
+        {
+            "1": "P",
+            1: "P",
+            1.0: "P",
+            "0": "N",
+            0: "N",
+            0.0: "N",
+        }
     )
+
+    dataframe = dataframe[dataframe["label_normalized"].isin(["P", "N"])].copy()
+    dataframe["embedding_distance"] = pd.to_numeric(
+        dataframe["embedding_distance"],
+        errors="coerce",
+    )
+    dataframe = dataframe.dropna(subset=["embedding_distance"])
+
+    positive = dataframe.loc[dataframe["label_normalized"] == "P", "embedding_distance"]
+    negative = dataframe.loc[dataframe["label_normalized"] == "N", "embedding_distance"]
+
+    stats_dataframe = pd.DataFrame(
+        [
+            {
+                "stage": "Trained",
+                "n_positive": len(positive),
+                "n_negative": len(negative),
+                "mean_positive_distance": float(positive.mean()),
+                "mean_negative_distance": float(negative.mean()),
+                "mean_difference_negative_minus_positive": float(negative.mean() - positive.mean()),
+            }
+        ]
+    )
+
+    output_stats_path.parent.mkdir(parents=True, exist_ok=True)
+    stats_dataframe.to_csv(output_stats_path, sep="\t", index=False)
+
+    rng = np.random.default_rng(42)
+
+    figure, axis = plt.subplots(figsize=(2.7, 2.6))
+    figure.patch.set_facecolor("white")
+    axis.set_facecolor("white")
+
+    plot_specs = [
+        ("P", 1, "Positive", "green"),
+        ("N", 2, "Negative", "red"),
+    ]
+
+    for label, x_center, label_name, color in plot_specs:
+        values = dataframe.loc[
+            dataframe["label_normalized"] == label,
+            "embedding_distance",
+        ].to_numpy(dtype=float)
+
+        x_jitter = rng.normal(0, 0.045, size=len(values))
+
+        axis.scatter(
+            np.full(len(values), x_center) + x_jitter,
+            values,
+            s=7,
+            alpha=0.28,
+            color=color,
+            edgecolors="none",
+            rasterized=True,
+            label=label_name,
+        )
+
+        axis.hlines(
+            np.mean(values),
+            x_center - 0.22,
+            x_center + 0.22,
+            color="black",
+            linewidth=1.4,
+            zorder=4,
+        )
+
+    axis.set_xticks([1, 2])
+    axis.set_xticklabels(["Positive", "Negative"], fontsize=10)
+
+    axis.set_ylabel("Embedding distance", fontsize=12)
+    axis.set_title("Test embedding distances", fontsize=12)
+
+    axis.tick_params(axis="both", labelsize=10)
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+
+    axis.grid(
+        True,
+        axis="y",
+        linestyle="--",
+        linewidth=0.55,
+        color="0.82",
+        alpha=0.65,
+    )
+    axis.set_axisbelow(True)
+
+    figure.tight_layout()
+    output_plot_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_plot_path, dpi=600, bbox_inches="tight")
+    plt.close(figure)
+
+    logger.info("Trained embedding distance scatter plot saved to %s", output_plot_path)
+
+def save_test_embedding_distance_statistics(
+    trained_dataframe: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    """Save t-test comparing trained test embedding distances between positive and negative pairs."""
+
+    dataframe = trained_dataframe.copy()
+
+    label_column = "original_label" if "original_label" in dataframe.columns else "label"
+
+    dataframe["label_normalized"] = dataframe[label_column].replace(
+        {
+            "1": "P",
+            1: "P",
+            1.0: "P",
+            "0": "N",
+            0: "N",
+            0.0: "N",
+        }
+    )
+
+    dataframe = dataframe[dataframe["label_normalized"].isin(["P", "N"])].copy()
+
+    positive = dataframe.loc[
+        dataframe["label_normalized"] == "P",
+        "embedding_distance",
+    ].to_numpy(dtype=float)
+
+    negative = dataframe.loc[
+        dataframe["label_normalized"] == "N",
+        "embedding_distance",
+    ].to_numpy(dtype=float)
+
+    if len(positive) < 2 or len(negative) < 2:
+        statistic = np.nan
+        p_value = np.nan
+    else:
+        test_result = ttest_ind(
+            positive,
+            negative,
+            equal_var=True,
+            alternative="less",
+            nan_policy="omit",
+        )
+        statistic = float(test_result.statistic)
+        p_value = float(test_result.pvalue)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    distance_dataframe.to_csv(
-        output_path,
-        sep="\t",
-        index=False,
+    with output_path.open("w", encoding="utf-8") as handle:
+        handle.write("Test embedding distance statistics\n")
+        handle.write("==================================\n\n")
+        handle.write("Comparison: positive pairs vs negative pairs\n")
+        handle.write("Test: one-sided Student t-test\n")
+        handle.write("Alternative: mean_positive_distance < mean_negative_distance\n\n")
+        handle.write(f"n_positive: {len(positive)}\n")
+        handle.write(f"n_negative: {len(negative)}\n")
+        handle.write(f"mean_positive_distance: {np.mean(positive):.6f}\n")
+        handle.write(f"mean_negative_distance: {np.mean(negative):.6f}\n")
+        handle.write(
+            "mean_difference_negative_minus_positive: "
+            f"{np.mean(negative) - np.mean(positive):.6f}\n"
+        )
+        handle.write(f"t_statistic: {statistic:.6f}\n")
+        handle.write(f"p_value_one_sided: {p_value:.6g}\n")
+
+    logger.info("Test embedding distance statistics saved to %s", output_path)
+
+def plot_loss_curves(
+    loss_path: Path,
+    output_path: Path | None = None,
+) -> Path:
+    """Plot training and validation loss across epochs."""
+
+    loss_dataframe = pd.read_csv(loss_path, sep="\t")
+
+    required_columns = {"epoch", "train_loss", "validation_loss"}
+    missing_columns = required_columns - set(loss_dataframe.columns)
+    if missing_columns:
+        raise ValueError(
+            f"Missing required columns in {loss_path}: {sorted(missing_columns)}"
+        )
+
+    if output_path is None:
+        output_path = loss_path.parent / "training_validation_loss.png"
+
+    figure, axis = plt.subplots(figsize=(3.25, 2.15))
+
+    axis.plot(
+        loss_dataframe["epoch"],
+        loss_dataframe["train_loss"],
+        marker="o",
+        linewidth=1.8,
+        markersize=3.0,
+        label="Training loss",
     )
 
-    summary_path = output_path.with_name(
-        output_path.stem + "_summary.tsv"
+    axis.plot(
+        loss_dataframe["epoch"],
+        loss_dataframe["validation_loss"],
+        marker="o",
+        linewidth=1.8,
+        markersize=3.0,
+        label="Validation loss",
     )
 
-    summary_dataframe.to_csv(
-        summary_path,
-        sep="\t",
-        index=False,
-    )
+    axis.set_xlabel("Epoch", fontsize=8)
+    axis.set_ylabel("Loss", fontsize=8)
+    axis.set_title("Training and validation loss", fontsize=8)
+    axis.xaxis.set_major_locator(MaxNLocator(integer=True))
+    axis.tick_params(axis="both", labelsize=7)
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+    axis.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.35)
+    axis.legend(frameon=False, fontsize=7)
 
-    logger.info(
-        "Untrained test embedding distances saved to %s",
-        output_path,
-    )
+    figure.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=600, bbox_inches="tight")
+    plt.close(figure)
 
-    logger.info(
-        "Untrained test embedding distance summary saved to %s",
-        summary_path,
-    )
+    logger.info("Loss curve plot saved to %s", output_path)
 
-    logger.info(
-        "Untrained test distance summary:\n%s",
-        summary_dataframe.to_string(index=False),
-    )
-
-    return summary_dataframe
+    return output_path
 
 
-# -----------------------------
-# Plots
-# -----------------------------
 def plot_epoch_embedding_distances(
     distances_path: Path,
     output_path: Path | None = None,
@@ -772,7 +1002,7 @@ def plot_epoch_embedding_distances(
     figure, axes = plt.subplots(
         nrows=1,
         ncols=2,
-        figsize=(7.2, 2.8),
+        figsize=(5.4, 2.2),
         sharey=True,
     )
 
@@ -802,24 +1032,28 @@ def plot_epoch_embedding_distances(
         axis.plot(
             positive_dataframe["epoch"],
             positive_dataframe["mean_cosine_distance"],
-            linewidth=2.0,
+            linewidth=1.4,
             marker="o",
-            markersize=3.5,
+            markersize=2.4,
             label="Positive pairs",
+            color="green"
         )
 
         axis.plot(
             negative_dataframe["epoch"],
             negative_dataframe["mean_cosine_distance"],
-            linewidth=2.0,
+            linewidth=1.4,
             marker="o",
-            markersize=3.5,
+            markersize=2.4,
             label="Negative pairs",
+            color="red"
         )
 
-        axis.set_title(plot_title)
-        axis.set_xlabel("Epoch")
-        axis.set_ylabel("Mean embedding distance")
+        axis.set_title(plot_title, fontsize=8)
+        axis.set_xlabel("Epoch", fontsize=8)
+        axis.set_ylabel("Mean embedding distance", fontsize=8)
+        axis.xaxis.set_major_locator(MaxNLocator(integer=True))
+        axis.tick_params(axis="both", labelsize=7)
 
         axis.spines["top"].set_visible(False)
         axis.spines["right"].set_visible(False)
@@ -827,12 +1061,12 @@ def plot_epoch_embedding_distances(
             True,
             axis="y",
             linestyle="--",
-            linewidth=0.6,
-            alpha=0.35,
+            linewidth=0.5,
+            alpha=0.3,
         )
 
     axes[1].set_ylabel("")
-    axes[0].legend(frameon=False, loc="best")
+    axes[0].legend(frameon=False, loc="best", fontsize=7)
 
     figure.tight_layout()
     figure.savefig(
@@ -931,10 +1165,10 @@ def plot_embedding_vs_expression_similarity(
     spearman_value, _ = spearmanr(x, y)
     kendall_value, _ = kendalltau(x, y)
 
-    plt.figure(figsize=(6, 5))
-    plt.scatter(x, y, alpha=0.2, s=6)
-    plt.xlabel("Embedding cosine similarity", fontsize=13)
-    plt.ylabel(f"Expression similarity ({metric_column})", fontsize=13)
+    plt.figure(figsize=(3.8, 3.1))
+    plt.scatter(x, y, alpha=0.18, s=4)
+    plt.xlabel("Embedding cosine similarity", fontsize=8)
+    plt.ylabel(f"Expression similarity ({metric_column})", fontsize=8)
     plt.title(
         (
             f"{title}\n"
@@ -942,14 +1176,14 @@ def plot_embedding_vs_expression_similarity(
             f"Spearman={spearman_value:.3f} | "
             f"Kendall={kendall_value:.3f}"
         ),
-        fontsize=14,
+        fontsize=8,
     )
-    plt.xticks(fontsize=11)
-    plt.yticks(fontsize=11)
+    plt.xticks(fontsize=7)
+    plt.yticks(fontsize=7)
     plt.tight_layout()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=300)
+    plt.savefig(output_path, dpi=600, bbox_inches="tight")
     plt.close()
 
 
@@ -1013,26 +1247,9 @@ def run_training(
         medium_kernel_size = best["medium_kernel_size"]
         large_kernel_size = best["large_kernel_size"]
 
-
-    if df_test is not None:
-        with torch.random.fork_rng(devices=[]):
-            torch.manual_seed(DEFAULT_RANDOM_STATE)
-
-            untrained_model = SiameseCNN(
-                dropout_rate=dropout_rate,
-                small_kernel_size=small_kernel_size,
-                medium_kernel_size=medium_kernel_size,
-                large_kernel_size=large_kernel_size,
-                attention_heads=attention_heads,
-                embedding_dim=embedding_dim,
-            )
-
-        save_untrained_test_embedding_distances(
-            model=untrained_model,
-            df_test=df_test,
-            batch_size=batch_size,
-            output_path=model_output_dir / "untrained_test_embedding_distances.tsv",
-        )
+    # This makes the final training reproducible whether or not Optuna ran before it.
+    set_reproducibility_seed(DEFAULT_RANDOM_STATE)
+    
 
     # Train with optimized hyperparameters (or default if optimization is disabled)
     train_loader_generator = torch.Generator()
@@ -1123,9 +1340,41 @@ def run_training(
         summary_path=model_output_dir / "training_summary.txt",
         training_summary=training_summary,
         diagnostics_path=model_output_dir / "epoch_embedding_distances.tsv",
+        loss_path=model_output_dir / "training_validation_loss.tsv",
         early_stopping_patience=DEFAULT_EARLY_STOPPING_PATIENCE,
         early_stopping_min_delta=DEFAULT_EARLY_STOPPING_MIN_DELTA,
     )
+
+    plot_loss_curves(
+        loss_path=model_output_dir / "training_validation_loss.tsv",
+        output_path=model_output_dir / "training_validation_loss.png",
+    )
+
+    if df_test is not None:
+        test_loader = DataLoader(
+            DNAPairDatasetWithMeta(df_test),
+            batch_size=batch_size,
+            shuffle=False,
+        )
+
+        trained_test_distance_dataframe = save_embedding_distance_distribution_from_model(
+            model=model,
+            loader=test_loader,
+            source_dataframe=df_test,
+            output_table_path=model_output_dir / "trained_test_embedding_distances.tsv",
+        )
+
+        save_test_embedding_distance_statistics(
+            trained_dataframe=trained_test_distance_dataframe,
+            output_path=model_output_dir / "test_embedding_distance_statistics.txt",
+        )
+
+        plot_trained_embedding_distance_scatter(
+            trained_dataframe=trained_test_distance_dataframe,
+            output_plot_path=model_output_dir / "test_embedding_distance_scatter.png",
+            output_stats_path=model_output_dir / "test_embedding_distance_statistics.tsv",
+        )
+
 
     plot_epoch_embedding_distances(
         distances_path=model_output_dir / "epoch_embedding_distances.tsv",

@@ -194,7 +194,7 @@ def plot_combined_pca_megaplot(pca_res, tissue_features, pc1_label, pc2_label, n
     cbar.set_label("Expression", fontsize=14, labelpad=10)
     cbar.ax.tick_params(labelsize=14)
 
-    plt.savefig("PCA_combined_megaplot.png", dpi=900, bbox_inches="tight")
+    plt.savefig("PCA_combined_megaplot.svg", format = "svg", dpi=900, bbox_inches="tight")
     plt.show()
 
 
@@ -286,7 +286,7 @@ ax.legend(
 )
 
 plt.tight_layout()
-plt.savefig("PCA_biplot.png", dpi=300)
+plt.savefig("PCA_biplot.svg", format="svg", dpi=900, bbox_inches="tight")
 plt.show()
 
 
@@ -406,7 +406,7 @@ for text, color in zip(legend.get_texts(), [species_colors["human"], species_col
     text.set_color(color)
 
 plt.tight_layout()
-plt.savefig("expression_distribution_by_tissue_species.png", dpi=300)
+plt.savefig("expression_distribution_by_tissue_species.svg", format="svg", dpi=900, bbox_inches="tight")
 plt.show()
 
 # ====================================
@@ -421,10 +421,10 @@ manifest = {
     "normalization_stage": args.normalization_stage,
     "distribution_filter": "expression <= 25" if args.normalization_stage == "before_norm" else None,
     "outputs": [
-        "PCA_combined_megaplot.png",
+        "PCA_combined_megaplot.svg",
         "PCA_results.tsv",
-        "PCA_biplot.png",
-        "expression_distribution_by_tissue_species.png",
+        "PCA_biplot.svg",
+        "expression_distribution_by_tissue_species.svg",
         "selected_normalization.txt",
         "data_exploration_manifest.json",
     ],

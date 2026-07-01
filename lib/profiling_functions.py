@@ -85,7 +85,7 @@ def gini(vector: np.ndarray) -> float:
 def met(df: pd.DataFrame, tissues: list[str]) -> pd.DataFrame:
     """Matched Expressed Tissues: fraction of tissues co-expressed in both species.
 
-    A gene is considered expressed if TPM >= 1. Score range: [0, 1].
+    A gene is considered expressed if expression > 1. Score range: [0, 1].
 
     Args:
         df: Input dataframe with TPM columns.
@@ -505,7 +505,7 @@ def benchmark_profiling(
 
     out_dir = output_dir / df_name / "Benchmarking"
     out_dir.mkdir(parents=True, exist_ok=True)
-    plt.savefig(out_dir / f"{df_name}_profiling_benchmark_ECDF.png", dpi=300)
+    plt.savefig(out_dir / f"{df_name}_profiling_benchmark_ECDF.svg", format="svg", dpi=300)
     plt.close()
 
     ks_df = pd.DataFrame(ks_results).sort_values("KS_D", ascending=False)

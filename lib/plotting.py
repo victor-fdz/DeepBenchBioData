@@ -211,6 +211,19 @@ def plot_correlations(
                 color=color,
             )
 
+            # add diagonal reference line
+            min_value = min(x.min(), y.min())
+            max_value = max(x.max(), y.max())
+
+            ax.plot(
+                [min_value, max_value],
+                [min_value, max_value],
+                linestyle="--",
+                linewidth=0.8,
+                color="black",
+                alpha=0.6,
+            )
+
             # compute correlation stats
             r_p, r_s = _get_stats(df_r, tissue, method_key)
 
@@ -234,10 +247,11 @@ def plot_correlations(
     plt.tight_layout()
 
     # save figure
-    out_path = output_dir / df_name / "Normalization" / f"{orthology}_scatter.png"
+    extension = "svg" if orthology == "Orthologs" else "png"
+    out_path = output_dir / df_name / "Normalization" / f"{orthology}_scatter.{extension}"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    plt.savefig(out_path, format="png")
+    plt.savefig(out_path, format=extension, dpi=300)
     plt.close()
 
     logger.info("Scatter plot saved to %s", out_path)
@@ -319,28 +333,44 @@ def plot_heatmap(
         "Spearman_rho": "Δ Spearman's Rho" if is_increment else "Spearman Rho",
     }.get(criteria, criteria)
 
-    plt.figure(figsize=FIGSIZE_HEATMAP)
+    fig, ax = plt.subplots(figsize=(8.5, 4.2))
 
-    sns.heatmap(
+    heatmap = sns.heatmap(
         df_heat,
         annot=True,
         cmap="BuGn",
         fmt=".3f",
         linewidths=0.5,
+        linecolor="white",
         vmin=0,
         vmax=1,
-        cbar_kws={"label": cbar_label},
+        annot_kws={
+            "size": 9,
+            "weight": "bold",
+        },
+        cbar_kws={
+            "label": cbar_label,
+            "shrink": 0.85,
+        },
+        ax=ax,
     )
 
-    plt.ylabel("Tissue")
-    plt.xlabel("Normalization Method")
-    plt.tight_layout()
+    ax.set_ylabel("Tissue", fontsize=11)
+    ax.set_xlabel("Normalization method", fontsize=11)
 
-    # save output
+    ax.tick_params(axis="x", labelsize=9, rotation=45)
+    ax.tick_params(axis="y", labelsize=9, rotation=0)
+
+    colorbar = heatmap.collections[0].colorbar
+    colorbar.ax.tick_params(labelsize=9)
+    colorbar.set_label(cbar_label, fontsize=10)
+
+    fig.tight_layout()
+
     out_path = output_dir / df_name / "Normalization" / f"{orthology}_{criteria.replace('_', '')}_heatmap.png"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    plt.savefig(out_path, format="png")
-    plt.close()
+    fig.savefig(out_path, dpi=600, bbox_inches="tight")
+    plt.close(fig)
 
     logger.info("Heatmap saved to %s", out_path) 

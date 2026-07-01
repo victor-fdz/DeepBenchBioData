@@ -102,8 +102,8 @@ def expression_vs_sequence(
     plt.legend()
     plt.tight_layout()
 
-    plot_path = out_dir /f"promoterIdentity_vs_{metric_func_name}.png"
-    plt.savefig(plot_path, format="png", dpi=150, bbox_inches="tight")
+    plot_path = out_dir /f"promoterIdentity_vs_{metric_func_name}.svg"
+    plt.savefig(plot_path, format="svg", dpi=150, bbox_inches="tight")
     plt.close()
     logger.info("Scatter plot saved to %s", plot_path)
 
