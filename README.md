@@ -1,4 +1,4 @@
-# DeepBenchBioData
+# DeepBenchBioData 🖥️🧬
 
 DeepBenchBioData is a Nextflow-based pipeline for cross-species gene expression benchmarking, promoter-sequence profiling, gene-pair labeling, sequence encoding, and deep learning model training/evaluation.
 
@@ -68,8 +68,3 @@ With the example above, outputs are written under `results/my_results/`:
 | `envs/environment_tfm.yml` | Environment definition. |
 | `data/` | Example input data and promoter files. |
 
-## Notes
-
-The `local` profile runs processes on the current machine. Adjust input paths, output directory, pair counts, split fractions, and model hyperparameters for each experiment.
-
-In the current configuration, the profiling module reads the promoter path from `profiling_promoter`; if using `--promoter`, ensure your local config maps it accordingly.
