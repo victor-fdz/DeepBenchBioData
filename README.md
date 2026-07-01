@@ -1,85 +1,75 @@
-<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/799c876f-e8e7-42a6-880d-0baa34b70bd4" />
+# DeepBenchBioData
 
+DeepBenchBioData is a Nextflow-based pipeline for cross-species gene expression benchmarking, promoter-sequence profiling, gene-pair labeling, sequence encoding, and deep learning model training/evaluation.
 
+## Pipeline
 
-# Normalization Pipeline
+`main_full_pipeline.nf` runs the full workflow:
 
-Cross-species gene expression normalization benchmarking pipeline.
+1. data exploration before normalization
+2. normalization benchmarking
+3. profiling benchmarking, with optional promoter-alignment comparison
+4. labeled gene-pair generation
+5. promoter-sequence encoding and train/validation/test splitting
+6. model training and evaluation
 
-## Installation
+## Requirements
 
-```bash
-cd normalization_pipeline
-pip install -e .
-```
+- Nextflow
+- A Micromamba/Conda environment named `environment_tfm`
+- The input expression table, promoter alignment, and human/mouse promoter FASTA files
+- Execution from the repository root
 
-This installs the package in **editable mode** — changes to the code take effect immediately without reinstalling.
+Before running the pipeline, load the environment with `micromamba activate environment_tfm`.
 
-## Usage
+## Inputs
 
-After installation, run from anywhere:
+| Parameter | Description |
+| --- | --- |
+| `--input` | Tabular gene expression dataset. |
+| `--name` | Run name used for metadata and output naming. |
+| `--promoter` | Promoter alignment path supplied to the run. |
+| `--human_fasta` | Human promoter FASTA file. |
+| `--mouse_fasta` | Mouse promoter FASTA file. |
+| `--labeling` | Strategy used to label gene pairs. |
+| `--split_mode` | Train/validation/test split strategy. |
+| `--val_frac`, `--test_frac` | Validation and test-set fractions. |
+| `--n_pos`, `--n_neg` | Number of positive and negative gene pairs. |
+| Model parameters | Training hyperparameters passed to the model step. |
 
-```bash
-normalize \
-  --input /path/to/your/data.tsv \
-  --name dataset_name \
-  --tissue General \
-  --r-exec /path/to/Rscript
-```
-
-### Arguments
-
-- `--input`: Path to input TSV with TPM values (required)
-- `--name`: Dataset name for output file naming (required)
-- `--tissue`: Tissue for method ranking (default: `General`)
-- `--r-exec`: Path to Rscript executable (default: `Rscript`)
-
-### Example
-
-```bash
-normalize \
-  --input data/kinases.tsv \
-  --name kinases \
-  --tissue heart
-```
-
-## Directory Structure
-
-```
-normalization_pipeline/
-├── bin/
-│   ├── normalize.py               # Main entry point
-│   └── deseq2_edger_normalize.R   # R normalization script
-├── lib/
-│   ├── __init__.py
-│   ├── modify_dataset.py          # Generate non-orthologous pairs
-│   ├── normalization.py           # Normalization functions
-│   ├── compute_stats.py           # Correlation statistics
-│   └── plotting.py                # Visualization utilities
-├── results/                       # Output directory (generated)
-├── requirements.txt
-├── setup.py
-└── README.md
-```
-
-## Output
-
-Results are saved to `results/<dataset_name>/`:
-- `Orthologs/` — Normalized orthologous datasets
-- `NonOrthologs/` — Normalized non-orthologous datasets  
-- `Normalization/` — Plots and stats summary
-
-## Development
-
-To modify the code:
-
-1. Edit files in `bin/` or `lib/`
-2. Changes take effect immediately (editable install)
-3. No need to reinstall
-
-To run without installing:
+## Runnable example
 
 ```bash
-cd normalization_pipeline
-PYTHONPATH=. python bin/normalize.py --input ... --name ...
+nextflow run main_full_pipeline.nf   -c conf/full_pipeline.config   -profile local   --input data/new_expression_data.txt   --name my_results --promoter data/kinases_promoter_alignment   --outdir results/my_results  --human_fasta data/promoter_kinases_human.fasta   --mouse_fasta data/promoter_kinases_mouse.fasta   --labeling rank_labeling  --split_mode anti_leakage   --val_frac 0.15   --test_frac 0.15   --n_pos 10000   --n_neg 8000   --epochs 40 --small_kernel_size 6 --medium_kernel_size 10 --large_kernel_size 20 --dropout 0.1 --learning_rate 0.0005 --weight_decay 0 
 ```
+
+## Outputs
+
+With the example above, outputs are written under `results/my_results/`:
+
+- `data_exploration/`: exploratory outputs before and after normalization
+- `normalization/`: normalization benchmark results and selected method
+- `profiling/`: profiling benchmark results and selected metric
+- `labeling/`: labeled gene-pair tables
+- `encoding/`: encoded sequences and train/validation/test splits
+- `model/`: trained model and evaluation outputs
+- `nextflow_reports/`: trace, timeline, report, and DAG files
+
+## Repository layout
+
+| Path | Purpose |
+| --- | --- |
+| `main_full_pipeline.nf` | Full pipeline entry point. |
+| `conf/full_pipeline.config` | Default parameters and execution profiles. |
+| `workflows/` | Workflow definitions. |
+| `modules/local/` | Nextflow process modules. |
+| `bin/` | Python wrappers called by Nextflow. |
+| `lib/` | Core Python implementation. |
+| `envs/environment_tfm.yml` | Environment definition. |
+| `data/` | Example input data and promoter files. |
+
+## Notes
+
+The `local` profile runs processes on the current machine. Adjust input paths, output directory, pair counts, split fractions, and model hyperparameters for each experiment.
+
+In the current configuration, the profiling module reads the promoter path from `profiling_promoter`; if using `--promoter`, ensure your local config maps it accordingly.
