@@ -68,3 +68,19 @@ With the example above, outputs are written under `results/my_results/`:
 | `envs/environment_tfm.yml` | Environment definition. |
 | `data/` | Example input data and promoter files. |
 
+
+## Adding New Metrics
+
+The benchmarking framework is easily extensible.
+
+To add a new normalization method:
+
+1. Implement the normalization function in `lib/normalization.py`.
+2. Add the function name to the `NORMALIZATION_METHODS` list.
+
+To add a new profiling metric:
+
+1. Implement the metric function in `lib/profiling_functions.py`.
+2. Register the function in:
+   - `INTERNAL_METRICS` if it is a **gene-wise** metric (computed independently for each species).
+   - `EXTERNAL_METRICS` if it is a **pair-wise** metric (computed directly between species).
